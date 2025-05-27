@@ -29,7 +29,7 @@ FRuntimeVirtualTextureFinalizer::FRuntimeVirtualTextureFinalizer(
 
 bool FRuntimeVirtualTextureFinalizer::IsReady()
 {
-	return RuntimeVirtualTexture::IsSceneReadyToRender(Scene->GetRenderScene());
+	return RuntimeVirtualTexture::IsSceneReadyToRender(Scene);
 }
 
 void FRuntimeVirtualTextureFinalizer::InitProducer(const FVirtualTextureProducerHandle& ProducerHandle)
@@ -42,11 +42,6 @@ void FRuntimeVirtualTextureFinalizer::InitProducer(const FVirtualTextureProducer
 		// We only need to do this once. If the associated scene proxy is removed this finalizer will also be destroyed.
 		const uint32 VirtualTextureSceneIndex = RenderScene->GetRuntimeVirtualTextureSceneIndex(ProducerId);
 		RuntimeVirtualTextureMask = 1 << VirtualTextureSceneIndex;
-
-		// Store the ProducerHandle in the FRuntimeVirtualTextureSceneProxy object.
-		// This is a bit of a hack: the proxy needs to know the producer handle but can't know it on proxy creation because the producer registration is deferred to the render thread.
-		check(ProducerHandle.PackedValue != 0);
-		RenderScene->RuntimeVirtualTextures[VirtualTextureSceneIndex]->ProducerHandle = ProducerHandle;
 
 		//todo[vt]: 
 		// Add a slow render path inside RenderPage() when this check fails. 
@@ -61,8 +56,11 @@ void FRuntimeVirtualTextureFinalizer::AddTile(FTileEntry& Tile)
 	Tiles.Add(Tile);
 }
 
-void FRuntimeVirtualTextureFinalizer::Finalize(FRHICommandListImmediate& RHICmdList)
+void FRuntimeVirtualTextureFinalizer::Finalize(FRDGBuilder& GraphBuilder)
 {
+	RDG_EVENT_SCOPE(GraphBuilder, "RuntimeVirtualTextureFinalize");
+	RDG_GPU_MASK_SCOPE(GraphBuilder, FRHIGPUMask::All());
+
 	RuntimeVirtualTexture::FRenderPageBatchDesc RenderPageBatchDesc;
 	RenderPageBatchDesc.Scene = Scene->GetRenderScene();
 	RenderPageBatchDesc.RuntimeVirtualTextureMask = RuntimeVirtualTextureMask;
@@ -72,18 +70,41 @@ void FRuntimeVirtualTextureFinalizer::Finalize(FRHICommandListImmediate& RHICmdL
 	RenderPageBatchDesc.MaxLevel = Desc.MaxLevel;
 	RenderPageBatchDesc.bClearTextures = bClearTextures;
 	RenderPageBatchDesc.bIsThumbnails = false;
-	RenderPageBatchDesc.DebugType = ERuntimeVirtualTextureDebugType::None;
+	RenderPageBatchDesc.FixedColor = FLinearColor::Transparent;
 	
 	for (int LayerIndex = 0; LayerIndex < RuntimeVirtualTexture::MaxTextureLayers; ++LayerIndex)
 	{
 		RenderPageBatchDesc.Targets[LayerIndex].Texture = Tiles[0].Targets[LayerIndex].TextureRHI != nullptr ? Tiles[0].Targets[LayerIndex].TextureRHI->GetTexture2D() : nullptr;
-		RenderPageBatchDesc.Targets[LayerIndex].UAV = Tiles[0].Targets[LayerIndex].UnorderedAccessViewRHI;
+		RenderPageBatchDesc.Targets[LayerIndex].PooledRenderTarget = Tiles[0].Targets[LayerIndex].PooledRenderTarget;
 	}
 
 	int32 BatchSize = 0;
 	for (auto Entry : Tiles)
 	{
-		RuntimeVirtualTexture::FRenderPageDesc& RenderPageDesc = RenderPageBatchDesc.PageDescs[BatchSize];
+		bool bBreakBatchForTextures = false;
+		for (int LayerIndex = 0; LayerIndex < RuntimeVirtualTexture::MaxTextureLayers; ++LayerIndex)
+		{
+			// This should never happen which is why we don't bother sorting to maximize batch size
+			bBreakBatchForTextures |= (RenderPageBatchDesc.Targets[LayerIndex].Texture != Entry.Targets[LayerIndex].TextureRHI);
+		}
+
+		if (BatchSize == RuntimeVirtualTexture::EMaxRenderPageBatch || bBreakBatchForTextures)
+		{
+			RenderPageBatchDesc.NumPageDescs = BatchSize;
+			RuntimeVirtualTexture::RenderPages(GraphBuilder, RenderPageBatchDesc);
+			BatchSize = 0;
+		}
+
+		if (bBreakBatchForTextures)
+		{
+			for (int LayerIndex = 0; LayerIndex < RuntimeVirtualTexture::MaxTextureLayers; ++LayerIndex)
+			{
+				RenderPageBatchDesc.Targets[LayerIndex].Texture = Entry.Targets[LayerIndex].TextureRHI != nullptr ? Entry.Targets[LayerIndex].TextureRHI->GetTexture2D() : nullptr;
+				RenderPageBatchDesc.Targets[LayerIndex].PooledRenderTarget = Entry.Targets[LayerIndex].PooledRenderTarget;
+			}
+		}
+
+		RuntimeVirtualTexture::FRenderPageDesc& RenderPageDesc = RenderPageBatchDesc.PageDescs[BatchSize++];
 
 		const float X = (float)FMath::ReverseMortonCode2_64(Entry.vAddress);
 		const float Y = (float)FMath::ReverseMortonCode2_64(Entry.vAddress >> 1);
@@ -105,34 +126,12 @@ void FRuntimeVirtualTextureFinalizer::Finalize(FRHICommandListImmediate& RHICmdL
 			RenderPageDesc.DestBox[LayerIndex] = FBox2D(DestinationBoxStart0, DestinationBoxStart0 + FVector2D(TileSize, TileSize));
 		}
 
-		bool bBreakBatchForTextures = false;
-		for (int LayerIndex = 0; LayerIndex < RuntimeVirtualTexture::MaxTextureLayers; ++LayerIndex)
-		{
-			// This should never happen which is why we don't bother sorting to maximize batch size
-			bBreakBatchForTextures |= (RenderPageBatchDesc.Targets[LayerIndex].Texture != Entry.Targets[LayerIndex].TextureRHI);
-		}
-
-		if (++BatchSize == RuntimeVirtualTexture::EMaxRenderPageBatch || bBreakBatchForTextures)
-		{
-			RenderPageBatchDesc.NumPageDescs = BatchSize;
-			RuntimeVirtualTexture::RenderPages(RHICmdList, RenderPageBatchDesc);
-			BatchSize = 0;
-		}
-
-		if (bBreakBatchForTextures)
-		{
-			for (int LayerIndex = 0; LayerIndex < RuntimeVirtualTexture::MaxTextureLayers; ++LayerIndex)
-			{
-				RenderPageBatchDesc.Targets[LayerIndex].Texture = Tiles[0].Targets[LayerIndex].TextureRHI != nullptr ? Tiles[0].Targets[LayerIndex].TextureRHI->GetTexture2D() : nullptr;
-				RenderPageBatchDesc.Targets[LayerIndex].UAV = Tiles[0].Targets[LayerIndex].UnorderedAccessViewRHI;
-			}
-		}
 	}
 
 	if (BatchSize > 0)
 	{
 		RenderPageBatchDesc.NumPageDescs = BatchSize;
-		RuntimeVirtualTexture::RenderPages(RHICmdList, RenderPageBatchDesc);
+		RuntimeVirtualTexture::RenderPages(GraphBuilder, RenderPageBatchDesc);
 	}
 
 	Tiles.SetNumUnsafeInternal(0);
@@ -151,25 +150,25 @@ FRuntimeVirtualTextureProducer::FRuntimeVirtualTextureProducer(
 }
 
 FVTRequestPageResult FRuntimeVirtualTextureProducer::RequestPageData(
+	FRHICommandList& RHICmdList,
 	const FVirtualTextureProducerHandle& ProducerHandle,
 	uint8 LayerMask,
 	uint8 vLevel,
 	uint64 vAddress,
 	EVTRequestPagePriority Priority)
 {
-	//todo[vt]: 
-	// Possibly throttle rendering according to performance and return Saturated here.
-
+	// Note that when the finalizer is not ready (outside of the Begin/End Scene Render) we return the Saturated status here.
+	// This is to indicate that the RVT can't render at this time (because we require the GPU Scene to be up to date).
+	// This will happen for DrawTileMesh() style rendering used by material/HLOD baking.
+	// It's best to avoid sampling RVT in material baking, but if it is necessary then an option is to have streaming mips built and enabled.
 	FVTRequestPageResult result;
 	result.Handle = 0;
-	//todo[vt]:
-	// Returning Saturated instead of Pending here because higher level ignores Pending for locked pages. Need to fix that...
 	result.Status = Finalizer.IsReady() ? EVTRequestPageStatus::Available : EVTRequestPageStatus::Saturated;
 	return result;
 }
 
 IVirtualTextureFinalizer* FRuntimeVirtualTextureProducer::ProducePageData(
-	FRHICommandListImmediate& RHICmdList,
+	FRHICommandList& RHICmdList,
 	ERHIFeatureLevel::Type FeatureLevel,
 	EVTProducePageFlags Flags,
 	const FVirtualTextureProducerHandle& ProducerHandle,

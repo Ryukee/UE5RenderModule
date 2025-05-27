@@ -9,7 +9,7 @@
 
 #include "ClearQuad.h"
 #include "SceneRendering.h"
-#include "SceneRenderTargets.h"
+#include "PostProcess/SceneRenderTargets.h"
 #include "RHIResources.h"
 #include "SystemTextures.h"
 #include "ScreenSpaceDenoise.h"
@@ -17,7 +17,7 @@
 #include "PostProcess/SceneFilterRendering.h"
 #include "PipelineStateCache.h"
 #include "RayTracing/RaytracingOptions.h"
-#include "Raytracing/RaytracingLighting.h"
+#include "RayTracing/RayTracingLighting.h"
 
 
 static TAutoConsoleVariable<int32> CVarRayTracingTranslucency(
@@ -26,7 +26,7 @@ static TAutoConsoleVariable<int32> CVarRayTracingTranslucency(
 	TEXT("-1: Value driven by postprocess volume (default) \n")
 	TEXT(" 0: ray tracing translucency off (use raster) \n")
 	TEXT(" 1: ray tracing translucency enabled"),
-	ECVF_RenderThreadSafe);
+	ECVF_RenderThreadSafe | ECVF_Scalability);
 
 static float GRayTracingTranslucencyMaxRoughness = -1;
 static FAutoConsoleVariableRef CVarRayTracingTranslucencyMaxRoughness(
@@ -108,22 +108,22 @@ DECLARE_GPU_STAT_NAMED(RayTracingTranslucency, TEXT("Ray Tracing Translucency"))
 
 #if RHI_RAYTRACING
 
-FRayTracingPrimaryRaysOptions GetRayTracingTranslucencyOptions()
+FRayTracingPrimaryRaysOptions GetRayTracingTranslucencyOptions(const FViewInfo& View)
 {
 	FRayTracingPrimaryRaysOptions Options;
 
-	Options.bEnabled = ShouldRenderRayTracingEffect(CVarRayTracingTranslucency.GetValueOnRenderThread() != 0);
-	Options.SamplerPerPixel = GRayTracingTranslucencySamplesPerPixel;
+	Options.bEnabled = ShouldRenderRayTracingTranslucency(View);
+	Options.SamplerPerPixel = GRayTracingTranslucencySamplesPerPixel >= 0 ? GRayTracingTranslucencySamplesPerPixel : View.FinalPostProcessSettings.RayTracingTranslucencySamplesPerPixel;
 	Options.ApplyHeightFog = GRayTracingTranslucencyHeightFog;
 	Options.PrimaryRayBias = GRayTracingTranslucencyPrimaryRayBias;
-	Options.MaxRoughness = GRayTracingTranslucencyMaxRoughness;
-	Options.MaxRefractionRays = GRayTracingTranslucencyMaxRefractionRays;
+	Options.MaxRoughness = GRayTracingTranslucencyMaxRoughness >= 0 ? GRayTracingTranslucencyMaxRoughness : View.FinalPostProcessSettings.RayTracingTranslucencyMaxRoughness;
+	Options.MaxRefractionRays = GRayTracingTranslucencyMaxRefractionRays >= 0 ? GRayTracingTranslucencyMaxRefractionRays : View.FinalPostProcessSettings.RayTracingTranslucencyRefractionRays;
 	Options.EnableEmmissiveAndIndirectLighting = GRayTracingTranslucencyEmissiveAndIndirectLighting;
 	Options.EnableDirectLighting = GRayTracingTranslucencyDirectLighting;
-	Options.EnableShadows = GRayTracingTranslucencyShadows;
+	Options.EnableShadows = GRayTracingTranslucencyShadows >= 0 ? GRayTracingTranslucencyShadows : (int) View.FinalPostProcessSettings.RayTracingTranslucencyShadows;
 	Options.MinRayDistance = GRayTracingTranslucencyMinRayDistance;
 	Options.MaxRayDistance = GRayTracingTranslucencyMaxRayDistance;
-	Options.EnableRefraction = GRayTracingTranslucencyRefraction;
+	Options.EnableRefraction = GRayTracingTranslucencyRefraction >= 0 ? GRayTracingTranslucencyRefraction : View.FinalPostProcessSettings.RayTracingTranslucencyRefraction;;
 
 	return Options;
 }
@@ -138,15 +138,17 @@ bool ShouldRenderRayTracingTranslucency(const FViewInfo& View)
 		? bViewWithRaytracingTranslucency
 		: RayTracingTranslucencyMode != 0;
 
-	return ShouldRenderRayTracingEffect(bTranslucencyEnabled);
+	return ShouldRenderRayTracingEffect(bTranslucencyEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline, View);
 }
 #endif // RHI_RAYTRACING
 
 void FDeferredShadingSceneRenderer::RenderRayTracingTranslucency(FRDGBuilder& GraphBuilder, FRDGTextureMSAA SceneColorTexture)
 {
-	if (!ShouldRenderTranslucency(ETranslucencyPass::TPT_StandardTranslucency)
+	if (   !ShouldRenderTranslucency(ETranslucencyPass::TPT_TranslucencyStandard)
+		&& !ShouldRenderTranslucency(ETranslucencyPass::TPT_TranslucencyStandardModulate)
 		&& !ShouldRenderTranslucency(ETranslucencyPass::TPT_TranslucencyAfterDOF)
 		&& !ShouldRenderTranslucency(ETranslucencyPass::TPT_TranslucencyAfterDOFModulate)
+		&& !ShouldRenderTranslucency(ETranslucencyPass::TPT_TranslucencyAfterMotionBlur)
 		&& !ShouldRenderTranslucency(ETranslucencyPass::TPT_AllTranslucency)
 		)
 	{
@@ -156,7 +158,7 @@ void FDeferredShadingSceneRenderer::RenderRayTracingTranslucency(FRDGBuilder& Gr
 	AddResolveSceneColorPass(GraphBuilder, Views, SceneColorTexture);
 
 	{
-		RDG_EVENT_SCOPE(GraphBuilder, "RayTracingTranslucency");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, RayTracingTranslucency, "RayTracingTranslucency");
 		RDG_GPU_STAT_SCOPE(GraphBuilder, RayTracingTranslucency)
 
 		for (int32 ViewIndex = 0, Num = Views.Num(); ViewIndex < Num; ViewIndex++)

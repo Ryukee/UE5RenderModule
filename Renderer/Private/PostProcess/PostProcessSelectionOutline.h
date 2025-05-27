@@ -6,6 +6,13 @@
 
 #include "ScreenPass.h"
 #include "OverridePassSequence.h"
+#include "PostProcess/LensDistortion.h"
+
+class FSceneUniformBuffer;
+namespace Nanite
+{
+	struct FRasterResults;
+}
 
 struct FSelectionOutlineInputs
 {
@@ -20,8 +27,17 @@ struct FSelectionOutlineInputs
 
 	// [Required] Used when scene textures are required by the material.
 	FSceneTextureShaderParameters SceneTextures;
+
+	// [Optional] Lens distortion applied on the scene color.
+	FLensDistortionLUT LensDistortionLUT;
 };
 
-FScreenPassTexture AddSelectionOutlinePass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FSelectionOutlineInputs& Inputs);
+FScreenPassTexture AddSelectionOutlinePass(
+	FRDGBuilder& GraphBuilder,
+	const FViewInfo& View,
+	FSceneUniformBuffer &SceneUniformBuffer,
+	const FSelectionOutlineInputs& Inputs,
+	const Nanite::FRasterResults* NaniteRasterResults,
+	FRDGTextureRef& DepthStencilTexture);
 
 #endif

@@ -4,9 +4,12 @@
 	LightFunctionRendering.cpp: Implementation for rendering light functions.
 =============================================================================*/
 
+#include "LightFunctionRendering.h"
 #include "CoreMinimal.h"
+#include "Engine/Engine.h"
 #include "HAL/IConsoleManager.h"
 #include "EngineGlobals.h"
+#include "Materials/Material.h"
 #include "RHIDefinitions.h"
 #include "RHI.h"
 #include "ShaderParameters.h"
@@ -14,6 +17,7 @@
 #include "SceneUtils.h"
 #include "RHIStaticStates.h"
 #include "PostProcess/SceneRenderTargets.h"
+#include "Materials/MaterialRenderProxy.h"
 #include "MaterialShaderType.h"
 #include "SceneRenderTargetParameters.h"
 #include "MaterialShader.h"
@@ -23,6 +27,10 @@
 #include "LightRendering.h"
 #include "PipelineStateCache.h"
 #include "ClearQuad.h"
+#include "HairStrands/HairStrandsData.h"
+#include "VariableRateShadingImageManager.h"
+
+using namespace LightFunctionAtlas;
 
 /**
  * A vertex shader for projecting a light function onto the scene.
@@ -49,9 +57,9 @@ public:
 		StencilingGeometryParameters.Bind(Initializer.ParameterMap);
 	}
 
-	void SetParameters(FRHICommandList& RHICmdList, const FSceneView& View, const FLightSceneInfo* LightSceneInfo )
+	void SetParameters(FRHIBatchedShaderParameters& BatchedParameters, const FSceneView& View, const FLightSceneInfo* LightSceneInfo )
 	{
-		FMaterialShader::SetViewParameters(RHICmdList, RHICmdList.GetBoundVertexShader(), View, View.ViewUniformBuffer);
+		FMaterialShader::SetViewParameters(BatchedParameters, View, View.ViewUniformBuffer);
 		
 		// Light functions are projected using a bounding sphere.
 		// Calculate transform for bounding stencil sphere.
@@ -61,9 +69,9 @@ public:
 			LightBounds.Center = View.ViewMatrices.GetViewOrigin();
 		}
 
-		FVector4 StencilingSpherePosAndScale;
+		FVector4f StencilingSpherePosAndScale;
 		StencilingGeometry::GStencilSphereVertexBuffer.CalcTransform(StencilingSpherePosAndScale, LightBounds, View.ViewMatrices.GetPreViewTranslation());
-		StencilingGeometryParameters.Set(RHICmdList, this, StencilingSpherePosAndScale);
+		StencilingGeometryParameters.Set(BatchedParameters, (FVector4f)StencilingSpherePosAndScale); // LWC_TODO: precision loss
 	}
 
 private:
@@ -71,6 +79,47 @@ private:
 };
 
 IMPLEMENT_MATERIAL_SHADER_TYPE(,FLightFunctionVS,TEXT("/Engine/Private/LightFunctionVertexShader.usf"),TEXT("Main"),SF_Vertex);
+
+void LightFunctionSvPositionToLightTransform(FMatrix44f& OutMatrix, const FViewInfo& View, const FLightSceneInfo& LightSceneInfo)
+{
+	const FVector Scale = LightSceneInfo.Proxy->GetLightFunctionScale();
+	// Switch x and z so that z of the user specified scale affects the distance along the light direction
+	const FVector InverseScale = FVector(1.0 / Scale.Z, 1.0 / Scale.Y, 1.0 / Scale.X);
+	const FMatrix WorldToLight = LightSceneInfo.Proxy->GetWorldToLight() * FScaleMatrix(InverseScale);
+	const FVector2D InvViewSize = FVector2D(1.0 / View.ViewRect.Width(), 1.0 / View.ViewRect.Height());
+
+	// setup a matrix to transform float4(SvPosition.xyz,1) directly to Light (quality, performance as we don't need to convert or use interpolator)
+	//	new_xy = (xy - ViewRectMin.xy) * ViewSizeAndInvSize.zw * float2(2,-2) + float2(-1, 1);
+	//  transformed into one MAD:  new_xy = xy * ViewSizeAndInvSize.zw * float2(2,-2)      +       (-ViewRectMin.xy) * ViewSizeAndInvSize.zw * float2(2,-2) + float2(-1, 1);
+
+	const double Mx = 2.0 * InvViewSize.X;
+	const double My = -2.0 * InvViewSize.Y;
+	const double Ax = -1.0 - 2.0 * View.ViewRect.Min.X * InvViewSize.X;
+	const double Ay = 1.0 + 2.0 * View.ViewRect.Min.Y * InvViewSize.Y;
+
+	// todo: we could use InvTranslatedViewProjectionMatrix and TranslatedWorldToLight for better quality
+	const FMatrix SvPositionToLightValue =
+		FMatrix(
+			FPlane(Mx,  0,   0,  0),
+			FPlane(0, My,   0,  0),
+			FPlane(0,  0,   1,  0),
+			FPlane(Ax, Ay,   0,  1)
+		) * View.ViewMatrices.GetInvViewProjectionMatrix() * WorldToLight;
+
+	OutMatrix = FMatrix44f(SvPositionToLightValue);
+}
+
+FVector3f GetCamRelativeLightPosition(const FViewMatrices& ViewMatrices, const FLightSceneInfo& LightSceneInfo)
+{
+	if (LightSceneInfo.Type == LightType_Directional)
+	{
+		return FVector3f::Zero();
+	}
+
+	FVector CameraPosition = ViewMatrices.GetViewOrigin();
+	FVector LightOrigin = LightSceneInfo.Proxy->GetOrigin();
+	return FVector3f(LightOrigin - CameraPosition);
+}
 
 /**
  * A pixel shader for projecting a light function onto the scene.
@@ -89,6 +138,13 @@ public:
 		return Parameters.MaterialParameters.MaterialDomain == MD_LightFunction && IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
 	}
 
+	static void ModifyCompilationEnvironment(const FMaterialShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FMaterialShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("SUBSTRATE_INLINE_SHADING"), 1);
+		OutEnvironment.SetDefine(TEXT("HAIR_STRANDS_SUPPORTED"), IsHairStrandsSupported(EHairStrandsShaderType::Strands, Parameters.Platform) ? 1 : 0);
+	}
+
 	FLightFunctionPS() {}
 	FLightFunctionPS(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
 		: FMaterialShader(Initializer)
@@ -96,59 +152,45 @@ public:
 		SvPositionToLight.Bind(Initializer.ParameterMap,TEXT("SvPositionToLight"));
 		LightFunctionParameters.Bind(Initializer.ParameterMap);
 		LightFunctionParameters2.Bind(Initializer.ParameterMap,TEXT("LightFunctionParameters2"));
+		HairOnlyDepthTexture.Bind(Initializer.ParameterMap, TEXT("HairOnlyDepthTexture"));
+		CameraRelativeLightPosition.Bind(Initializer.ParameterMap, TEXT("CameraRelativeLightPosition"));
 	}
 
-	void SetParameters(FRHICommandList& RHICmdList, const FViewInfo& View, const FLightSceneInfo* LightSceneInfo, const FMaterialRenderProxy* MaterialProxy, bool bRenderingPreviewShadowIndicator, float ShadowFadeFraction )
+	void SetParameters(FRHIBatchedShaderParameters& BatchedParameters, const FViewInfo& View, const FLightSceneInfo* LightSceneInfo, const FMaterialRenderProxy* MaterialProxy, const FMaterial& Material, bool bRenderingPreviewShadowIndicator, float ShadowFadeFraction, bool bUseHairStrands, FRHITexture* InHairOnlyDepthTexture)
 	{
-		FRHIPixelShader* ShaderRHI = RHICmdList.GetBoundPixelShader();
-		FMaterialShader::SetViewParameters(RHICmdList, ShaderRHI, View, View.ViewUniformBuffer);
-		FMaterialShader::SetParameters(RHICmdList, ShaderRHI, MaterialProxy, *MaterialProxy->GetMaterial(View.GetFeatureLevel()), View);
+		FMaterialShader::SetViewParameters(BatchedParameters, View, View.ViewUniformBuffer);
+		FMaterialShader::SetParameters(BatchedParameters, MaterialProxy, Material, View);
 
 		// Set the transform from screen space to light space.
 		if ( SvPositionToLight.IsBound() )
 		{
-			const FVector Scale = LightSceneInfo->Proxy->GetLightFunctionScale();
-			// Switch x and z so that z of the user specified scale affects the distance along the light direction
-			const FVector InverseScale = FVector( 1.f / Scale.Z, 1.f / Scale.Y, 1.f / Scale.X );
-			const FMatrix WorldToLight = LightSceneInfo->Proxy->GetWorldToLight() * FScaleMatrix(FVector(InverseScale));	
-
-			FVector2D InvViewSize = FVector2D(1.0f / View.ViewRect.Width(), 1.0f / View.ViewRect.Height());
-
-			// setup a matrix to transform float4(SvPosition.xyz,1) directly to Light (quality, performance as we don't need to convert or use interpolator)
-
-			//	new_xy = (xy - ViewRectMin.xy) * ViewSizeAndInvSize.zw * float2(2,-2) + float2(-1, 1);
-
-			//  transformed into one MAD:  new_xy = xy * ViewSizeAndInvSize.zw * float2(2,-2)      +       (-ViewRectMin.xy) * ViewSizeAndInvSize.zw * float2(2,-2) + float2(-1, 1);
-
-			float Mx = 2.0f * InvViewSize.X;
-			float My = -2.0f * InvViewSize.Y;
-			float Ax = -1.0f - 2.0f * View.ViewRect.Min.X * InvViewSize.X;
-			float Ay = 1.0f + 2.0f * View.ViewRect.Min.Y * InvViewSize.Y;
-
-			// todo: we could use InvTranslatedViewProjectionMatrix and TranslatedWorldToLight for better quality
-			const FMatrix SvPositionToLightValue = 
-				FMatrix(
-					FPlane(Mx,  0,   0,  0),
-					FPlane( 0, My,   0,  0),
-					FPlane( 0,  0,   1,  0),
-					FPlane(Ax, Ay,   0,  1)
-				) * View.ViewMatrices.GetInvViewProjectionMatrix() * WorldToLight;
-
-			SetShaderValue(RHICmdList, ShaderRHI, SvPositionToLight, SvPositionToLightValue );
+			FMatrix44f SvPositionToLightValue;
+			LightFunctionSvPositionToLightTransform(SvPositionToLightValue, View, *LightSceneInfo);
+			SetShaderValue(BatchedParameters, SvPositionToLight, SvPositionToLightValue);
 		}
 
-		LightFunctionParameters.Set(RHICmdList, ShaderRHI, LightSceneInfo, ShadowFadeFraction);
+		LightFunctionParameters.Set(BatchedParameters, LightSceneInfo, ShadowFadeFraction);
 
-		SetShaderValue(RHICmdList, ShaderRHI, LightFunctionParameters2, FVector(
+		SetShaderValue(BatchedParameters, LightFunctionParameters2, FVector4f(
 			LightSceneInfo->Proxy->GetLightFunctionFadeDistance(), 
 			LightSceneInfo->Proxy->GetLightFunctionDisabledBrightness(),
-			bRenderingPreviewShadowIndicator ? 1.0f : 0.0f));
+			bRenderingPreviewShadowIndicator ? 1.0f : 0.0f,
+			bUseHairStrands ? 1.0f : 0.0f));
+
+		if (HairOnlyDepthTexture.IsBound() && InHairOnlyDepthTexture)
+		{
+			SetTextureParameter(BatchedParameters, HairOnlyDepthTexture, InHairOnlyDepthTexture);
+		}
+
+		if (CameraRelativeLightPosition.IsBound())
+		{
+			SetShaderValue(BatchedParameters, CameraRelativeLightPosition, GetCamRelativeLightPosition(View.ViewMatrices, *LightSceneInfo));
+		}
 
 		auto DeferredLightParameter = GetUniformBufferParameter<FDeferredLightUniformStruct>();
-
 		if (DeferredLightParameter.IsBound())
 		{
-			SetDeferredLightParameters(RHICmdList, ShaderRHI, DeferredLightParameter, LightSceneInfo, View);
+			SetDeferredLightParameters(BatchedParameters, DeferredLightParameter, LightSceneInfo, View, LightFunctionAtlas::IsEnabled(View, ELightFunctionAtlasSystem::DeferredLighting));
 		}
 	}
 
@@ -156,12 +198,13 @@ private:
 	LAYOUT_FIELD(FShaderParameter, SvPositionToLight);
 	LAYOUT_FIELD(FLightFunctionSharedParameters, LightFunctionParameters);
 	LAYOUT_FIELD(FShaderParameter, LightFunctionParameters2);
+	LAYOUT_FIELD(FShaderResourceParameter, HairOnlyDepthTexture);
+	LAYOUT_FIELD(FShaderParameter, CameraRelativeLightPosition);
 };
 
 IMPLEMENT_MATERIAL_SHADER_TYPE(,FLightFunctionPS,TEXT("/Engine/Private/LightFunctionPixelShader.usf"),TEXT("Main"),SF_Pixel);
 
-/** Returns a fade fraction for a light function and a given view based on the appropriate fade settings. */
-static float GetLightFunctionFadeFraction(const FViewInfo& View, FSphere LightBounds)
+float GetLightFunctionFadeFraction(const FViewInfo& View, FSphere LightBounds)
 {
 	extern float CalculateShadowFadeAlpha(const float MaxUnclampedResolution, const uint32 ShadowFadeResolution, const uint32 MinShadowResolution);
 
@@ -199,7 +242,7 @@ bool FSceneRenderer::CheckForLightFunction( const FLightSceneInfo* LightSceneInf
 {
 	// NOTE: The extra check is necessary because there could be something wrong with the material.
 	if( LightSceneInfo->Proxy->GetLightFunctionMaterial() && 
-		LightSceneInfo->Proxy->GetLightFunctionMaterial()->GetMaterial(Scene->GetFeatureLevel())->IsLightFunction())
+		LightSceneInfo->Proxy->GetLightFunctionMaterial()->GetIncompleteMaterialWithFallback(Scene->GetFeatureLevel()).IsLightFunction())
 	{
 		FSphere LightBounds = LightSceneInfo->Proxy->GetBoundingSphere();
 		for (int32 ViewIndex = 0;ViewIndex < Views.Num();ViewIndex++)
@@ -229,16 +272,16 @@ bool FSceneRenderer::CheckForLightFunction( const FLightSceneInfo* LightSceneInf
  */
 bool FDeferredShadingSceneRenderer::RenderLightFunction(
 	FRDGBuilder& GraphBuilder,
-	FRDGTextureRef SceneDepthTexture,
-	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer,
+	const FMinimalSceneTextures& SceneTextures,
 	const FLightSceneInfo* LightSceneInfo,
 	FRDGTextureRef ScreenShadowMaskTexture,
 	bool bLightAttenuationCleared,
-	bool bProjectingForForwardShading)
+	bool bProjectingForForwardShading,
+	bool bUseHairStrands)
 {
 	if (ViewFamily.EngineShowFlags.LightFunctions)
 	{
-		return RenderLightFunctionForMaterial(GraphBuilder, SceneDepthTexture, SceneTexturesUniformBuffer, LightSceneInfo, ScreenShadowMaskTexture, LightSceneInfo->Proxy->GetLightFunctionMaterial(), bLightAttenuationCleared, bProjectingForForwardShading, false);
+		return RenderLightFunctionForMaterial(GraphBuilder, SceneTextures, LightSceneInfo, ScreenShadowMaskTexture, LightSceneInfo->Proxy->GetLightFunctionMaterial(), bLightAttenuationCleared, bProjectingForForwardShading, false, bUseHairStrands);
 	}
 	
 	return false;
@@ -246,15 +289,15 @@ bool FDeferredShadingSceneRenderer::RenderLightFunction(
 
 bool FDeferredShadingSceneRenderer::RenderPreviewShadowsIndicator(
 	FRDGBuilder& GraphBuilder,
-	FRDGTextureRef SceneDepthTexture,
-	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer,
+	const FMinimalSceneTextures& SceneTextures,
 	const FLightSceneInfo* LightSceneInfo,
 	FRDGTextureRef ScreenShadowMaskTexture,
-	bool bLightAttenuationCleared)
+	bool bLightAttenuationCleared,
+	bool bUseHairStrands)
 {
 	if (GEngine->PreviewShadowsIndicatorMaterial)
 	{
-		return RenderLightFunctionForMaterial(GraphBuilder, SceneDepthTexture, SceneTexturesUniformBuffer, LightSceneInfo, ScreenShadowMaskTexture, GEngine->PreviewShadowsIndicatorMaterial->GetRenderProxy(), bLightAttenuationCleared, false, true);
+		return RenderLightFunctionForMaterial(GraphBuilder, SceneTextures, LightSceneInfo, ScreenShadowMaskTexture, GEngine->PreviewShadowsIndicatorMaterial->GetRenderProxy(), bLightAttenuationCleared, false, true, bUseHairStrands);
 	}
 
 	return false;
@@ -262,37 +305,53 @@ bool FDeferredShadingSceneRenderer::RenderPreviewShadowsIndicator(
 
 BEGIN_SHADER_PARAMETER_STRUCT(FRenderLightFunctionForMaterialParameters, )
 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, SceneTextures)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HairOnlyDepthTexture)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
+static bool TryGetLightFunctionShaders(ERHIFeatureLevel::Type InFeatureLevel, FMaterialRenderProxy const*& OutMaterialProxy, FMaterial const*& OutMaterial, FMaterialShaders& OutShaders)
+{
+	while (OutMaterialProxy)
+	{
+		OutMaterial = OutMaterialProxy->GetMaterialNoFallback(InFeatureLevel);
+		if (OutMaterial && OutMaterial->IsLightFunction())
+		{
+			FMaterialShaderTypes ShaderTypes;
+			ShaderTypes.AddShaderType<FLightFunctionVS>();
+			ShaderTypes.AddShaderType<FLightFunctionPS>();
+			if (OutMaterial->TryGetShaders(ShaderTypes, nullptr, OutShaders))
+			{
+				return true;
+			}
+		}
+		OutMaterialProxy = OutMaterialProxy->GetFallback(InFeatureLevel);
+	}
+	return false;
+}
+
 bool FDeferredShadingSceneRenderer::RenderLightFunctionForMaterial(
 	FRDGBuilder& GraphBuilder,
-	FRDGTextureRef SceneDepthTexture,
-	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer,
+	const FMinimalSceneTextures& SceneTextures,
 	const FLightSceneInfo* LightSceneInfo,
 	FRDGTextureRef ScreenShadowMaskTexture,
 	const FMaterialRenderProxy* MaterialProxy,
 	bool bLightAttenuationCleared,
 	bool bProjectingForForwardShading,
-	bool bRenderingPreviewShadowsIndicator)
+	bool bRenderingPreviewShadowsIndicator,
+	bool bUseHairStrands)
 {
 	check(ScreenShadowMaskTexture);
 	check(LightSceneInfo);
 
-	if (!MaterialProxy)
-	{
-		return false;
-	}
-
-	const FMaterial* Material = MaterialProxy->GetMaterial(Scene->GetFeatureLevel());
-
-	if (!Material->IsLightFunction())
+	FMaterialShaders MaterialShaders;
+	const FMaterialRenderProxy* MaterialProxyForRendering = MaterialProxy;
+	const FMaterial* MaterialForRendering = nullptr;
+	if (!TryGetLightFunctionShaders(Scene->GetFeatureLevel(), MaterialProxyForRendering, MaterialForRendering, MaterialShaders))
 	{
 		return false;
 	}
 
 	const FLightSceneProxy* LightSceneProxy = LightSceneInfo->Proxy;
-	const FMaterialShaderMap* MaterialShaderMap = Material->GetRenderingThreadShaderMap();
 
 	// Render to the light attenuation buffer for all views.
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
@@ -305,15 +364,23 @@ bool FDeferredShadingSceneRenderer::RenderLightFunctionForMaterial(
 		if (View.VisibleLightInfos[LightSceneInfo->Id].bInViewFrustum)
 		{
 			FRenderLightFunctionForMaterialParameters* PassParameters = GraphBuilder.AllocParameters<FRenderLightFunctionForMaterialParameters>();
-			PassParameters->SceneTextures = SceneTexturesUniformBuffer;
+			PassParameters->SceneTextures = SceneTextures.UniformBuffer;
+			PassParameters->HairOnlyDepthTexture = (View.HairStrandsViewData.bIsValid && View.HairStrandsViewData.VisibilityData.HairOnlyDepthTexture) ? View.HairStrandsViewData.VisibilityData.HairOnlyDepthTexture : GSystemTextures.GetDepthDummy(GraphBuilder);
 			PassParameters->RenderTargets[0] = FRenderTargetBinding(ScreenShadowMaskTexture, bLightAttenuationCleared ? ERenderTargetLoadAction::ELoad : ERenderTargetLoadAction::ENoAction);
-			PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(SceneDepthTexture, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilWrite);
+			PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(SceneTextures.Depth.Target, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilWrite);
+			PassParameters->RenderTargets.ShadingRateTexture = GVRSImageManager.GetVariableRateShadingImage(GraphBuilder, View, FVariableRateShadingImageManager::EVRSPassType::LightFunctions);
+
+			// If render shadow mask for hair strands, then swap depth to hair only depth
+			if (bUseHairStrands)
+			{
+				PassParameters->RenderTargets.DepthStencil = FDepthStencilBinding(View.HairStrandsViewData.VisibilityData.HairOnlyDepthTexture, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ELoad, FExclusiveDepthStencil::DepthRead_StencilWrite);
+			}
 
 			GraphBuilder.AddPass(
-				RDG_EVENT_NAME("LightFunction Material=%s", *Material->GetFriendlyName()),
+				RDG_EVENT_NAME("LightFunction Material=%s", *MaterialForRendering->GetFriendlyName()),
 				PassParameters,
 				ERDGPassFlags::Raster,
-				[&View, LightSceneInfo, LightSceneProxy, MaterialProxy, MaterialShaderMap, bLightAttenuationCleared, bProjectingForForwardShading, bRenderingPreviewShadowsIndicator](FRHICommandList& RHICmdList)
+				[&View, PassParameters, LightSceneInfo, LightSceneProxy, MaterialProxyForRendering, MaterialForRendering, MaterialShaders, bLightAttenuationCleared, bProjectingForForwardShading, bRenderingPreviewShadowsIndicator, bUseHairStrands](FRDGAsyncTask, FRHICommandList& RHICmdList)
 			{
 				FSphere LightBounds = LightSceneProxy->GetBoundingSphere();
 
@@ -337,8 +404,10 @@ bool FDeferredShadingSceneRenderer::RenderLightFunctionForMaterial(
 					RHICmdList.SetViewport(View.ViewRect.Min.X, View.ViewRect.Min.Y, 0.0f, View.ViewRect.Max.X, View.ViewRect.Max.Y, 1.0f);
 
 					// Set the states to modulate the light function with the render target.
-					TShaderRef<FLightFunctionVS> VertexShader = MaterialShaderMap->GetShader<FLightFunctionVS>();
-					TShaderRef<FLightFunctionPS> PixelShader = MaterialShaderMap->GetShader<FLightFunctionPS>();
+					TShaderRef<FLightFunctionVS> VertexShader;
+					TShaderRef<FLightFunctionPS> PixelShader;
+					MaterialShaders.TryGetVertexShader(VertexShader);
+					MaterialShaders.TryGetPixelShader(PixelShader);
 
 					FGraphicsPipelineStateInitializer GraphicsPSOInit;
 					RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
@@ -384,11 +453,17 @@ bool FDeferredShadingSceneRenderer::RenderLightFunctionForMaterial(
 
 					// Set the light's scissor rectangle.
 					LightSceneProxy->SetScissorRect(RHICmdList, View, View.ViewRect);
+					if (bUseHairStrands)
+					{
+						FIntRect TotalRect = ComputeVisibleHairStrandsMacroGroupsRect(View, View.ViewRect, View.HairStrandsViewData.MacroGroupDatas);
+						LightSceneProxy->SetScissorRect(RHICmdList, View, TotalRect);
+					}
 
 					// Render a bounding light sphere.
-					SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit);
-					VertexShader->SetParameters(RHICmdList, View, LightSceneInfo);
-					PixelShader->SetParameters(RHICmdList, View, LightSceneInfo, MaterialProxy, bRenderingPreviewShadowsIndicator, FadeAlpha);
+					SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
+
+					SetShaderParametersLegacyVS(RHICmdList, VertexShader, View, LightSceneInfo);
+					SetShaderParametersLegacyPS(RHICmdList, PixelShader, View, LightSceneInfo, MaterialProxyForRendering, *MaterialForRendering, bRenderingPreviewShadowsIndicator, FadeAlpha, bUseHairStrands, PassParameters->HairOnlyDepthTexture->GetRHI());
 
 					// Project the light function using a sphere around the light
 					//@todo - could use a cone for spotlights

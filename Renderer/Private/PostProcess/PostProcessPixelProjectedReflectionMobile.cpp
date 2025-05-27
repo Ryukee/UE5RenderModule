@@ -11,6 +11,7 @@
 #include "MobileBasePassRendering.h"
 #include "ScreenPass.h"
 #include "RenderTargetPool.h"
+#include "ScenePrivate.h"
 
 
 static TAutoConsoleVariable<int32> CVarMobilePlanarReflectionMode(
@@ -29,10 +30,22 @@ static TAutoConsoleVariable<int32> CVarMobilePixelProjectedReflectionQuality(
 	TEXT("The quality of pixel projected reflection on mobile platform.\n")
 	TEXT("0: Disabled\n")
 	TEXT("1: Best performance but may have some artifacts in some view angles. [default]\n")
-	TEXT("2: Better quality and reasonable performance and could fix some artifacts, but the PlanarReflection mesh has to render twice.\n")
+	TEXT("2: Better quality and reasonable performance and could fix some artifacts.\n")
 	TEXT("3: Best quality but will be much heavier.\n"),
 	ECVF_Scalability | ECVF_RenderThreadSafe
 );
+
+bool ProjectionOutputTexture(EShaderPlatform ShaderPlatform)
+{
+	if (IsMetalPlatform(ShaderPlatform))
+	{
+		return false;
+	}
+	else
+	{
+		return true;
+	}
+}
 
 class FPixelProjectedReflectionMobile_ProjectionPassCS : public FGlobalShader
 {
@@ -50,17 +63,14 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
-		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, OutputProjection)
-#else
-		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutputProjection)
-#endif
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler) 
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, OutputProjectionTexture)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, OutputProjectionBuffer)
 		
-		SHADER_PARAMETER(FVector4, ReflectionPlane)
-		SHADER_PARAMETER_EX(FVector4, ViewRectMin, EShaderPrecisionModifier::Half)
-		SHADER_PARAMETER_EX(FVector4, BufferSizeAndInvSize, EShaderPrecisionModifier::Half)
-		SHADER_PARAMETER_EX(FVector4, ViewSizeAndInvSize, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER(FVector4f, ReflectionPlane)
+		SHADER_PARAMETER_EX(FVector4f, ViewRectMin, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER_EX(FVector4f, BufferSizeAndInvSize, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER_EX(FVector4f, ViewSizeAndInvSize, EShaderPrecisionModifier::Half)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -76,7 +86,7 @@ public:
 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZEY"), ThreadGroupSizeY);
 
 		OutEnvironment.SetDefine(TEXT("PROJECTION_PASS_COMPUTE_SHADER"), 1u);
-		OutEnvironment.SetDefine(TEXT("PROJECTION_OUTPUT_TYPE"), PROJECTION_OUTPUT_TYPE);
+		OutEnvironment.SetDefine(TEXT("PROJECTION_OUTPUT_TYPE_TEXTURE"), ProjectionOutputTexture(Parameters.Platform) ? 1u : 0u);
 	}
 };
 
@@ -93,7 +103,7 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
-		SHADER_PARAMETER(FMatrix, LocalToWorld)
+		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -125,16 +135,12 @@ public:
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, ProjectionBuffer)
-		SHADER_PARAMETER_SAMPLER(SamplerState, ProjectionBufferSampler)
-#else
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint>, ProjectionTextureSRV)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, ProjectionBuffer)
-#endif
-		SHADER_PARAMETER(FVector4, ReflectionPlane)
-		SHADER_PARAMETER_EX(FVector4, BufferSizeAndInvSize, EShaderPrecisionModifier::Half)
-		SHADER_PARAMETER_EX(FVector4, ViewSizeAndInvSize, EShaderPrecisionModifier::Half)
-		SHADER_PARAMETER_EX(FVector4, ViewRectMin, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER(FVector4f, ReflectionPlane)
+		SHADER_PARAMETER_EX(FVector4f, BufferSizeAndInvSize, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER_EX(FVector4f, ViewSizeAndInvSize, EShaderPrecisionModifier::Half)
+		SHADER_PARAMETER_EX(FVector4f, ViewRectMin, EShaderPrecisionModifier::Half)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -148,7 +154,7 @@ public:
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		
 		OutEnvironment.SetDefine(TEXT("REFLECTION_PASS_PIXEL_SHADER"), 1u);
-		OutEnvironment.SetDefine(TEXT("PROJECTION_OUTPUT_TYPE"), PROJECTION_OUTPUT_TYPE);
+		OutEnvironment.SetDefine(TEXT("PROJECTION_OUTPUT_TYPE_TEXTURE"), ProjectionOutputTexture(Parameters.Platform) ? 1u : 0u);
 	}
 
 	static FPermutationDomain BuildPermutationVector(int32 QualityLevel)
@@ -161,8 +167,6 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FPixelProjectedReflectionMobile_ReflectionPassPS, "/Engine/Private/PostProcessPixelProjectedReflectionMobile.usf", "ReflectionPassPS", SF_Pixel);
 
-FPixelProjectedReflectionMobileOutputs GPixelProjectedReflectionMobileOutputs;
-
 class FReflectionPlaneVertexDeclaration : public FRenderResource
 {
 public:
@@ -171,10 +175,10 @@ public:
 	// Destructor
 	virtual ~FReflectionPlaneVertexDeclaration() {}
 
-	virtual void InitRHI() override
+	virtual void InitRHI(FRHICommandListBase& RHICmdList) override
 	{
 		FVertexDeclarationElementList Elements;
-		Elements.Add(FVertexElement(0, 0, VET_Float2, 0, sizeof(FVector2D)));
+		Elements.Add(FVertexElement(0, 0, VET_Float2, 0, sizeof(FVector2f)));
 		VertexDeclarationRHI = PipelineStateCache::GetOrCreateVertexDeclaration(Elements);
 	}
 
@@ -186,56 +190,42 @@ public:
 
 TGlobalResource<FReflectionPlaneVertexDeclaration> GReflectionPlaneVertexDeclaration;
 
-void FMobileSceneRenderer::InitPixelProjectedReflectionOutputs(FRHICommandListImmediate& RHICmdList, const FIntPoint& BufferSize)
+FRDGTextureRef CreateMobilePixelProjectedReflectionTexture(FRDGBuilder& GraphBuilder, FIntPoint Extent)
 {
-	if (!GPixelProjectedReflectionMobileOutputs.IsValid() || GPixelProjectedReflectionMobileOutputs.PixelProjectedReflectionTexture->GetDesc().Extent != BufferSize)
-	{
-		GPixelProjectedReflectionMobileOutputs.PixelProjectedReflectionTexture.SafeRelease();
-
-		GRenderTargetPool.FindFreeElement(RHICmdList, FPooledRenderTargetDesc::Create2DDesc(BufferSize, PF_FloatRGBA, FClearValueBinding::Transparent, TexCreate_None, TexCreate_RenderTargetable | TexCreate_ShaderResource | TexCreate_UAV, false, 1, false), GPixelProjectedReflectionMobileOutputs.PixelProjectedReflectionTexture, TEXT("PixelProjectedReflectionTexture"));
-	}
-}
-
-void FMobileSceneRenderer::ReleasePixelProjectedReflectionOutputs()
-{
-	GPixelProjectedReflectionMobileOutputs.Release();
-}
-
-void FMobileSceneRenderer::RenderPixelProjectedReflection(FRHICommandListImmediate& RHICmdList, const FSceneRenderTargets& SceneContext, const FPlanarReflectionSceneProxy* PlanarReflectionSceneProxy)
-{
-	checkSlow(GPixelProjectedReflectionMobileOutputs.IsValid());
-
-	SCOPED_DRAW_EVENT(RHICmdList, PixelProjectedReflection);
-
-	FMemMark Mark(FMemStack::Get());
-	FRDGBuilder GraphBuilder(RHICmdList);
-
-	FRDGTextureRef SceneColorTexture = GraphBuilder.RegisterExternalTexture(SceneContext.GetSceneColor(), TEXT("SceneColorTexture"));
-
-	FRDGTextureRef SceneDepthTexture = GraphBuilder.RegisterExternalTexture(SceneContext.SceneDepthZ, TEXT("SceneDepthTexture"));
-
-	FRDGTextureRef PixelProjectedReflectionTexture = GraphBuilder.RegisterExternalTexture(GPixelProjectedReflectionMobileOutputs.PixelProjectedReflectionTexture, TEXT("PixelProjectedReflectionTexture"));
-
-	RenderPixelProjectedReflection(GraphBuilder, SceneColorTexture, SceneDepthTexture, PixelProjectedReflectionTexture, PlanarReflectionSceneProxy);
-
-	GraphBuilder.Execute();
+	return GraphBuilder.CreateTexture(
+		FRDGTextureDesc::Create2D(Extent, PF_FloatRGBA, FClearValueBinding::Transparent, TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV),
+		TEXT("PixelProjectedReflectionTexture"));
 }
 
 void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuilder, FRDGTextureRef SceneColorTexture, FRDGTextureRef SceneDepthTexture, FRDGTextureRef PixelProjectedReflectionTexture, const FPlanarReflectionSceneProxy* PlanarReflectionSceneProxy)
 {
 	const FIntPoint BufferSize = PlanarReflectionSceneProxy->RenderTarget->GetSizeXY();
+	
+	FRDGTextureRef ProjectionTexture = nullptr;
+	FRDGTextureSRVRef ProjectionTextureSRV = nullptr;
+	FRDGTextureUAVRef ProjectionTextureUAV = nullptr;
 
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-	FRDGTextureRef ProjectionBuffer = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(BufferSize, PF_R32_UINT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("ProjectionTexture"));
-	FRDGTextureUAVRef ProjectionBufferUAV = GraphBuilder.CreateUAV(ProjectionBuffer);
-	uint32 ClearColor[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
-	AddClearUAVPass(GraphBuilder, ProjectionBufferUAV, ClearColor);
-#else
-	FRDGBufferRef ProjectionBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), BufferSize.X * BufferSize.Y), TEXT("ProjectionBuffer"));
-	FRDGBufferSRVRef ProjectionBufferSRV = GraphBuilder.CreateSRV(ProjectionBuffer, PF_R32_UINT);
-	FRDGBufferUAVRef ProjectionBufferUAV = GraphBuilder.CreateUAV(ProjectionBuffer, PF_R32_UINT);
-	AddClearUAVPass(GraphBuilder, ProjectionBufferUAV, 0xFFFFFFFF);
-#endif
+	FRDGBufferRef ProjectionBuffer = nullptr;
+	FRDGBufferSRVRef ProjectionBufferSRV = nullptr;
+	FRDGBufferUAVRef ProjectionBufferUAV = nullptr;
+
+	bool bProjectionOutputTexture = ProjectionOutputTexture(ShaderPlatform);
+
+	if (bProjectionOutputTexture)
+	{
+		ProjectionTexture = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(BufferSize, PF_R32_UINT, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_UAV), TEXT("ProjectionTexture"));
+		ProjectionTextureSRV = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(ProjectionTexture));
+		ProjectionTextureUAV = GraphBuilder.CreateUAV(ProjectionTexture);
+		uint32 ClearColor[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+		AddClearUAVPass(GraphBuilder, ProjectionTextureUAV, ClearColor);
+	}
+	else
+	{
+		ProjectionBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), BufferSize.X * BufferSize.Y), TEXT("ProjectionBuffer"));
+		ProjectionBufferSRV = GraphBuilder.CreateSRV(ProjectionBuffer, PF_R32_UINT);
+		ProjectionBufferUAV = GraphBuilder.CreateUAV(ProjectionBuffer, PF_R32_UINT);
+		AddClearUAVPass(GraphBuilder, ProjectionBufferUAV, 0xFFFFFFFF);
+	}
 
 	// Projection pass
 	for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
@@ -251,22 +241,25 @@ void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuil
 		PassParameters->SceneDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
 		FPlane ReflectionPlaneViewSpace = PlanarReflectionSceneProxy->ReflectionPlane.TransformBy(View.ViewMatrices.GetViewMatrix());
-		PassParameters->ReflectionPlane = ReflectionPlaneViewSpace;
+		PassParameters->ReflectionPlane = FVector3f(ReflectionPlaneViewSpace);
 		PassParameters->ReflectionPlane.W = ReflectionPlaneViewSpace.W;
 
-		PassParameters->ViewRectMin = FVector4(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, 0.0f);
+		PassParameters->ViewRectMin = FVector4f(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, 0.0f);
 
-		PassParameters->BufferSizeAndInvSize = FVector4(BufferSize.X, BufferSize.Y, 1.0f / BufferSize.X, 1.0f / BufferSize.Y);
+		PassParameters->BufferSizeAndInvSize = FVector4f(BufferSize.X, BufferSize.Y, 1.0f / BufferSize.X, 1.0f / BufferSize.Y);
 
-		PassParameters->ViewSizeAndInvSize = FVector4(ViewRect.Width(), ViewRect.Height(), 1.0f / ViewRect.Width(), 1.0f / ViewRect.Height());
+		PassParameters->ViewSizeAndInvSize = FVector4f(ViewRect.Width(), ViewRect.Height(), 1.0f / ViewRect.Width(), 1.0f / ViewRect.Height());
 
-		PassParameters->OutputProjection = ProjectionBufferUAV;
+		PassParameters->OutputProjectionTexture = ProjectionTextureUAV;
+
+		PassParameters->OutputProjectionBuffer = ProjectionBufferUAV;
 
 		TShaderMapRef<FPixelProjectedReflectionMobile_ProjectionPassCS> ComputeShader(View.ShaderMap);
 
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
 			RDG_EVENT_NAME("PixelProjectedReflection_Projection %dx%d (CS)", ViewRect.Width(), ViewRect.Height()),
+			ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 			ComputeShader,
 			PassParameters,
 			FComputeShaderUtils::GetGroupCount(ViewRect.Size(), FPixelProjectedReflectionMobile_ProjectionPassCS::TexelsPerThreadGroup));
@@ -287,7 +280,7 @@ void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuil
 
 		FVector PlanarReflectionPlaneExtent = PlanarReflectionSceneProxy->WorldBounds.GetExtent();
 
-		VSShaderParameters->LocalToWorld = FScaleMatrix::Make(FVector(PlanarReflectionPlaneExtent.X, PlanarReflectionPlaneExtent.Y, 1.0f)) * FRotationMatrix::MakeFromXY(PlanarReflectionSceneProxy->PlanarReflectionXAxis, PlanarReflectionSceneProxy->PlanarReflectionYAxis) * FTranslationMatrix::Make(PlanarReflectionSceneProxy->PlanarReflectionOrigin);
+		VSShaderParameters->LocalToWorld = FMatrix44f(FScaleMatrix::Make(FVector(PlanarReflectionPlaneExtent.X, PlanarReflectionPlaneExtent.Y, 1.0f)) * FRotationMatrix::MakeFromXY(PlanarReflectionSceneProxy->PlanarReflectionXAxis, PlanarReflectionSceneProxy->PlanarReflectionYAxis) * FTranslationMatrix::Make(PlanarReflectionSceneProxy->PlanarReflectionOrigin));	// LWC_TODO: Precision loss
 
 		auto ShaderPermutationVector = FPixelProjectedReflectionMobile_ReflectionPassPS::BuildPermutationVector(GetMobilePixelProjectedReflectionQuality() - 1);
 
@@ -295,34 +288,36 @@ void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuil
 
 		FPixelProjectedReflectionMobile_ReflectionPassPS::FParameters* PSShaderParameters = GraphBuilder.AllocParameters<FPixelProjectedReflectionMobile_ReflectionPassPS::FParameters>();
 
-		PSShaderParameters->RenderTargets[0] = FRenderTargetBinding(PixelProjectedReflectionTexture, ERenderTargetLoadAction::EClear);
+		PSShaderParameters->RenderTargets[0] = FRenderTargetBinding(PixelProjectedReflectionTexture, ViewIndex > 0 ? ERenderTargetLoadAction::ELoad : ERenderTargetLoadAction::EClear);
 
 		PSShaderParameters->View = View.ViewUniformBuffer;
 		PSShaderParameters->SceneColorTexture = SceneColorTexture;
 		PSShaderParameters->SceneColorSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
-#if PROJECTION_OUTPUT_TYPE == PROJECTION_OUTPUT_TYPE_TEXTURE
-		PSShaderParameters->ProjectionBuffer = ProjectionBuffer;
-		PSShaderParameters->ProjectionBufferSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-#else
-		PSShaderParameters->ProjectionBuffer = ProjectionBufferSRV;
-#endif
+		if (bProjectionOutputTexture)
+		{
+			PSShaderParameters->ProjectionTextureSRV = ProjectionTextureSRV;
+		}
+		else
+		{
+			PSShaderParameters->ProjectionBuffer = ProjectionBufferSRV;
+		}
 
-		PSShaderParameters->ViewRectMin = FVector4(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, 0.0f);
+		PSShaderParameters->ViewRectMin = FVector4f(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, 0.0f);
 
-		PSShaderParameters->BufferSizeAndInvSize = FVector4(BufferSize.X, BufferSize.Y, 1.0f / BufferSize.X, 1.0f / BufferSize.Y);
+		PSShaderParameters->BufferSizeAndInvSize = FVector4f(BufferSize.X, BufferSize.Y, 1.0f / BufferSize.X, 1.0f / BufferSize.Y);
 
-		PSShaderParameters->ViewSizeAndInvSize = FVector4(ViewRect.Width(), ViewRect.Height(), 1.0f / ViewRect.Width(), 1.0f / ViewRect.Height());
+		PSShaderParameters->ViewSizeAndInvSize = FVector4f(ViewRect.Width(), ViewRect.Height(), 1.0f / ViewRect.Width(), 1.0f / ViewRect.Height());
 
-		PSShaderParameters->ReflectionPlane = PlanarReflectionSceneProxy->ReflectionPlane;
+		PSShaderParameters->ReflectionPlane = FVector3f(PlanarReflectionSceneProxy->ReflectionPlane); // LWC_TODO: precision loss
 
 		ClearUnusedGraphResources(PixelShader, PSShaderParameters);
 
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("PixelProjectedReflection_Reflection %dx%d (PS)", ViewRect.Width(), ViewRect.Height()),
 			PSShaderParameters,
-			ERDGPassFlags::Raster,
-			[VertexShader, VSShaderParameters, PixelShader, PSShaderParameters, ViewRect](FRHICommandList& RHICmdList)
+			ERDGPassFlags::Raster | ERDGPassFlags::NeverCull,
+			[VertexShader, VSShaderParameters, PixelShader, PSShaderParameters, ViewRect](FRDGAsyncTask, FRHICommandList& RHICmdList)
 		{
 			RHICmdList.SetViewport(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, ViewRect.Max.X, ViewRect.Max.Y, 1.0f);
 
@@ -338,7 +333,7 @@ void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuil
 			GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
 			GraphicsPSOInit.PrimitiveType = PT_TriangleStrip;
 
-			SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit);
+			SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
 
 			SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), *VSShaderParameters);
 			SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), *PSShaderParameters);
@@ -346,5 +341,10 @@ void FMobileSceneRenderer::RenderPixelProjectedReflection(FRDGBuilder& GraphBuil
 			RHICmdList.SetStreamSource(0, GScreenSpaceVertexBuffer.VertexBufferRHI, 0);
 			RHICmdList.DrawPrimitive(0, 2, 1);
 		});
+
+		if (View.ViewState && !View.bStatePrevViewInfoIsReadOnly)
+		{
+			GraphBuilder.QueueTextureExtraction(PixelProjectedReflectionTexture, &View.ViewState->PrevFrameViewInfo.MobilePixelProjectedReflection);
+		}
 	}
 }

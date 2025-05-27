@@ -5,6 +5,8 @@
 #include "PostProcess/PostProcessBufferInspector.h"
 #include "SceneTextureParameters.h"
 #include "ScenePrivate.h"
+#include "UnrealClient.h"
+#include "UnrealEngine.h"
 
 BEGIN_SHADER_PARAMETER_STRUCT(FPixelInspectorParameters, )
 	RDG_TEXTURE_ACCESS(GBufferA, ERHIAccess::CopySrc)
@@ -38,11 +40,11 @@ void ProcessPixelInspectorRequests(
 		if (PixelInspectorRequest->RequestComplete == true)
 		{
 			PixelInspectorRequest->RenderingCommandSend = true;
-			ProcessRequests.Add(KeyValue.Key);
+			ProcessRequests.Add(FVector2D(KeyValue.Key));
 		}
 		else if (PixelInspectorRequest->RenderingCommandSend == false && PixelInspectorRequest->ViewId == ViewUniqueId)
 		{
-			FVector2D SourceViewportUV = PixelInspectorRequest->SourceViewportUV;
+			FVector2D SourceViewportUV = FVector2D(PixelInspectorRequest->SourceViewportUV);
 			FVector2D ExtendSize(1.0f, 1.0f);
 
 			//////////////////////////////////////////////////////////////////////////
@@ -55,7 +57,7 @@ void ProcessPixelInspectorRequests(
 					0
 				);
 
-				const FTexture2DRHIRef &DestinationBufferDepth = PixelInspectorData.RenderTargetBufferDepth[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+				const FTextureRHIRef &DestinationBufferDepth = PixelInspectorData.RenderTargetBufferDepth[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 				if (DestinationBufferDepth.IsValid())
 				{
 					FRHITexture* SourceBufferSceneDepth = Parameters.SceneDepth->GetRHI();
@@ -71,7 +73,7 @@ void ProcessPixelInspectorRequests(
 
 			//////////////////////////////////////////////////////////////////////////
 			// FINAL COLOR
-			const FTexture2DRHIRef &DestinationBufferFinalColor = PixelInspectorData.RenderTargetBufferFinalColor[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+			const FTextureRHIRef &DestinationBufferFinalColor = PixelInspectorData.RenderTargetBufferFinalColor[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 			if (DestinationBufferFinalColor.IsValid())
 			{
 				const FIntVector SourcePoint(
@@ -112,7 +114,7 @@ void ProcessPixelInspectorRequests(
 
 			//////////////////////////////////////////////////////////////////////////
 			// ORIGINAL SCENE COLOR
-			const FTexture2DRHIRef& DestinationBufferSceneColor = PixelInspectorData.RenderTargetBufferSceneColor[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+			const FTextureRHIRef& DestinationBufferSceneColor = PixelInspectorData.RenderTargetBufferSceneColor[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 			if (DestinationBufferSceneColor.IsValid())
 			{
 				const FIntVector SourcePoint(
@@ -133,7 +135,7 @@ void ProcessPixelInspectorRequests(
 
 			//////////////////////////////////////////////////////////////////////////
 			// HDR
-			const FTexture2DRHIRef &DestinationBufferHDR = PixelInspectorData.RenderTargetBufferHDR[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+			const FTextureRHIRef &DestinationBufferHDR = PixelInspectorData.RenderTargetBufferHDR[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 			if (DestinationBufferHDR.IsValid())
 			{
 				const FIntVector SourcePoint(
@@ -165,7 +167,7 @@ void ProcessPixelInspectorRequests(
 					0
 				);
 
-				const FTexture2DRHIRef &DestinationBufferA = PixelInspectorData.RenderTargetBufferA[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+				const FTextureRHIRef &DestinationBufferA = PixelInspectorData.RenderTargetBufferA[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 				if (DestinationBufferA.IsValid() && Parameters.GBufferA)
 				{
 					FRHITexture* SourceBufferA = Parameters.GBufferA->GetRHI();
@@ -181,7 +183,7 @@ void ProcessPixelInspectorRequests(
 
 			//////////////////////////////////////////////////////////////////////////
 			// GBuffer BCDEF
-			const FTexture2DRHIRef &DestinationBufferBCDEF = PixelInspectorData.RenderTargetBufferBCDEF[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
+			const FTextureRHIRef &DestinationBufferBCDEF = PixelInspectorData.RenderTargetBufferBCDEF[PixelInspectorRequest->BufferIndex]->GetRenderTargetTexture();
 			if (DestinationBufferBCDEF.IsValid())
 			{
 				const FIntVector SourcePoint(
@@ -255,14 +257,14 @@ void ProcessPixelInspectorRequests(
 			}
 
 			PixelInspectorRequest->RenderingCommandSend = true;
-			ProcessRequests.Add(KeyValue.Key);
+			ProcessRequests.Add(FVector2D(KeyValue.Key));
 		}
 	}
 
 	// Remove request we just processed.
 	for (FVector2D RequestKey : ProcessRequests)
 	{
-		PixelInspectorData.Requests.Remove(RequestKey);
+		PixelInspectorData.Requests.Remove(FVector2f(RequestKey));	// LWC_TODO: Precision loss
 	}
 }
 
@@ -278,7 +280,7 @@ FScreenPassTexture AddPixelInspectorPass(FRDGBuilder& GraphBuilder, const FViewI
 
 	// Perform copies of scene textures data into staging resources for visualization.
 	{
-		FSceneTextureParameters SceneTextures = GetSceneTextureParameters(GraphBuilder);
+		FSceneTextureParameters SceneTextures = GetSceneTextureParameters(GraphBuilder, View);
 
 		// GBufferF is optional, so it may be a dummy texture. Revert it to null if so.
 		if (SceneTextures.GBufferFTexture->Desc.Extent != Inputs.OriginalSceneColor.Texture->Desc.Extent)

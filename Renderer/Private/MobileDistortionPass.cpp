@@ -5,12 +5,19 @@ MobileDistortionPass.cpp - Mobile specific rendering of primtives with refractio
 =============================================================================*/
 
 #include "MobileDistortionPass.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "TranslucentRendering.h"
 #include "DynamicPrimitiveDrawing.h"
 #include "PostProcess/PostProcessing.h"
 #include "PostProcess/SceneFilterRendering.h"
 #include "PipelineStateCache.h"
+#include "ScenePrivate.h"
 #include "DistortionRendering.h"
+
+BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FMobileDistortionPassUniformParameters, RENDERER_API)
+	SHADER_PARAMETER_STRUCT(FMobileSceneTextureUniformParameters, SceneTextures)
+	SHADER_PARAMETER(FVector4f, DistortionParams)
+END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 IMPLEMENT_STATIC_UNIFORM_BUFFER_STRUCT(FMobileDistortionPassUniformParameters, "MobileDistortionPass", SceneTextures);
 
@@ -19,20 +26,17 @@ bool IsMobileDistortionActive(const FViewInfo& View)
 	static IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DisableDistortion"));
 	int32 DisableDistortion = CVar->GetInt();
 
-	// Distortion on mobile requires SceneDepth information in SceneColor.A channel
-	const EMobileHDRMode HDRMode = GetMobileHDRMode();
-	const bool bVisiblePrims = View.ParallelMeshDrawCommandPasses[EMeshPass::Distortion].HasAnyDraw();
-
 	return
-		HDRMode == EMobileHDRMode::EnabledFloat16 &&
 		View.Family->EngineShowFlags.Translucency &&
-		bVisiblePrims &&
+		View.bHasDistortionPrimitives &&
 		FSceneRenderer::GetRefractionQuality(*View.Family) > 0 &&
 		DisableDistortion == 0;
 }
 
 BEGIN_SHADER_PARAMETER_STRUCT(FMobileDistortionPassParameters, )
+	SHADER_PARAMETER_STRUCT_INCLUDE(FViewShaderParameters, View)
 	SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FMobileDistortionPassUniformParameters, Pass)
+	SHADER_PARAMETER_STRUCT_INCLUDE(FInstanceCullingDrawParams, InstanceCullingDrawParams)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
@@ -40,42 +44,51 @@ TRDGUniformBufferRef<FMobileDistortionPassUniformParameters> CreateMobileDistort
 {
 	auto* Parameters = GraphBuilder.AllocParameters<FMobileDistortionPassUniformParameters>();
 
-	FSceneRenderTargets& SceneContext = FSceneRenderTargets::Get(GraphBuilder.RHICmdList);
-
-	EMobileSceneTextureSetupMode SetupMode = EMobileSceneTextureSetupMode::SceneColor;
+	EMobileSceneTextureSetupMode SetupMode = EMobileSceneTextureSetupMode::None;
 	if (View.bCustomDepthStencilValid)
 	{
 		SetupMode |= EMobileSceneTextureSetupMode::CustomDepth;
 	}
 
-	SetupMobileSceneTextureUniformParameters(GraphBuilder, SetupMode, Parameters->SceneTextures);
+	if (MobileRequiresSceneDepthAux(View.GetShaderPlatform()))
+	{
+		SetupMode |= EMobileSceneTextureSetupMode::SceneDepthAux;
+	}
+	else
+	{
+		SetupMode |= EMobileSceneTextureSetupMode::SceneDepth;
+	}
+
+	SetupMobileSceneTextureUniformParameters(GraphBuilder, View.GetSceneTexturesChecked(), SetupMode, Parameters->SceneTextures);
 
 	SetupDistortionParams(Parameters->DistortionParams, View);
 
 	return GraphBuilder.CreateUniformBuffer(Parameters);
 }
 
-FMobileDistortionAccumulateOutputs AddMobileDistortionAccumulatePass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileDistortionAccumulateInputs& Inputs)
+FMobileDistortionAccumulateOutputs AddMobileDistortionAccumulatePass(FRDGBuilder& GraphBuilder, FScene* Scene, const FViewInfo& View, const FMobileDistortionAccumulateInputs& Inputs)
 {
 	FRDGTextureDesc DistortionAccumulateDesc = FRDGTextureDesc::Create2D(Inputs.SceneColor.Texture->Desc.Extent, PF_B8G8R8A8, FClearValueBinding::Transparent, TexCreate_ShaderResource | TexCreate_RenderTargetable);
 
 	FScreenPassRenderTarget DistortionAccumulateOutput = FScreenPassRenderTarget(GraphBuilder.CreateTexture(DistortionAccumulateDesc, TEXT("DistortionAccumulatePass")), Inputs.SceneColor.ViewRect, ERenderTargetLoadAction::EClear);
 
 	FMobileDistortionPassParameters* PassParameters = GraphBuilder.AllocParameters<FMobileDistortionPassParameters>();
+	PassParameters->View = View.GetShaderParameters();
 	PassParameters->Pass = CreateMobileDistortionPassUniformBuffer(GraphBuilder, View);
 	PassParameters->RenderTargets[0] = DistortionAccumulateOutput.GetRenderTargetBinding();
 
 	const FScreenPassTextureViewport SceneColorViewport(Inputs.SceneColor);
 
+	const_cast<FViewInfo&>(View).ParallelMeshDrawCommandPasses[EMeshPass::Distortion].BuildRenderingCommands(GraphBuilder, Scene->GPUScene, PassParameters->InstanceCullingDrawParams);
+
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("DistortionAccumulate %dx%d", SceneColorViewport.Rect.Width(), SceneColorViewport.Rect.Height()),
 		PassParameters,
 		ERDGPassFlags::Raster,
-		[&View, SceneColorViewport](FRHICommandList& RHICmdList)
+		[&View, SceneColorViewport, PassParameters](FRHICommandList& RHICmdList)
 	{
 		RHICmdList.SetViewport(SceneColorViewport.Rect.Min.X, SceneColorViewport.Rect.Min.Y, 0.0f, SceneColorViewport.Rect.Max.X, SceneColorViewport.Rect.Max.Y, 1.0f);
-
-		View.ParallelMeshDrawCommandPasses[EMeshPass::Distortion].DispatchDraw(nullptr, RHICmdList);
+		View.ParallelMeshDrawCommandPasses[EMeshPass::Distortion].Draw(RHICmdList, &PassParameters->InstanceCullingDrawParams);
 	});
 
 	FMobileDistortionAccumulateOutputs Outputs;
@@ -110,7 +123,7 @@ IMPLEMENT_GLOBAL_SHADER(FMobileDistortionMergePS, "/Engine/Private/DistortApplyS
 
 FScreenPassTexture AddMobileDistortionMergePass(FRDGBuilder& GraphBuilder, const FViewInfo& View, const FMobileDistortionMergeInputs& Inputs)
 {
-	FRDGTextureDesc DistortionMergeDesc = FRDGTextureDesc::Create2D(Inputs.DistortionAccumulate.Texture->Desc.Extent, PF_FloatRGBA, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_RenderTargetable);
+	FRDGTextureDesc DistortionMergeDesc = FRDGTextureDesc::Create2D(Inputs.DistortionAccumulate.Texture->Desc.Extent, Inputs.SceneColor.Texture->Desc.Format, FClearValueBinding::Black, TexCreate_ShaderResource | TexCreate_RenderTargetable);
 
 	FScreenPassRenderTarget DistortionMergeOutput = FScreenPassRenderTarget(GraphBuilder.CreateTexture(DistortionMergeDesc, TEXT("DistortionMergePass")), Inputs.DistortionAccumulate.ViewRect, ERenderTargetLoadAction::EClear);
 

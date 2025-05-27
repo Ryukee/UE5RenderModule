@@ -4,12 +4,14 @@
 	SceneRendering.cpp: Scene rendering.
 =============================================================================*/
 
+#include "SceneTextureReductions.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "ScenePrivate.h"
 #include "RenderGraph.h"
 #include "PixelShaderUtils.h"
 #include "SceneTextureParameters.h"
 #include "PostProcess/PostProcessing.h" // for FPostProcessVS
-
+#include "Froxel/Froxel.h"
 
 static TAutoConsoleVariable<int32> CVarHZBBuildUseCompute(
 	TEXT("r.HZB.BuildUseCompute"), 1,
@@ -19,14 +21,15 @@ static TAutoConsoleVariable<int32> CVarHZBBuildUseCompute(
 
 
 BEGIN_SHADER_PARAMETER_STRUCT(FSharedHZBParameters, )
-	SHADER_PARAMETER(FVector4, DispatchThreadIdToBufferUV)
-	SHADER_PARAMETER(FVector2D, InputViewportMaxBound)
-	SHADER_PARAMETER(FVector2D, InvSize)
+	SHADER_PARAMETER(FVector4f, DispatchThreadIdToBufferUV)
+	SHADER_PARAMETER(FIntVector4, PixelViewPortMinMax)
+	SHADER_PARAMETER(FVector2f, InputViewportMaxBound)
+	SHADER_PARAMETER(FVector2f, InvSize)
 
 	SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, ParentTextureMip)
 	SHADER_PARAMETER_SAMPLER(SamplerState, ParentTextureMipSampler)
 
-	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint2>, VisBufferTexture)
 END_SHADER_PARAMETER_STRUCT()
 
 
@@ -37,12 +40,13 @@ class FHZBBuildPS : public FGlobalShader
 
 	BEGIN_SHADER_PARAMETER_STRUCT( FParameters, )
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSharedHZBParameters, Shared)
+		SHADER_PARAMETER(int32, SourceMipIndex)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		return true;
 	}
 
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
@@ -58,14 +62,16 @@ class FHZBBuildCS : public FGlobalShader
 
 	static constexpr int32 kMaxMipBatchSize = 4;
 
+	class FDimVisBufferFormat : SHADER_PERMUTATION_INT("VIS_BUFFER_FORMAT", 4);
 	class FDimFurthest : SHADER_PERMUTATION_BOOL("DIM_FURTHEST");
 	class FDimClosest : SHADER_PERMUTATION_BOOL("DIM_CLOSEST");
+	class FDimFroxels : SHADER_PERMUTATION_BOOL("DIM_FROXELS");
 	class FDimMipLevelCount : SHADER_PERMUTATION_RANGE_INT("DIM_MIP_LEVEL_COUNT", 1, kMaxMipBatchSize);
-	using FPermutationDomain = TShaderPermutationDomain<FDimFurthest, FDimClosest, FDimMipLevelCount>;
+	using FPermutationDomain = TShaderPermutationDomain<FDimFurthest, FDimClosest, FDimFroxels, FDimMipLevelCount, FDimVisBufferFormat>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSharedHZBParameters, Shared)
-
+		SHADER_PARAMETER_STRUCT_INCLUDE(Froxel::FBuilderParameters, FroxelBuilder)		
 		SHADER_PARAMETER_RDG_TEXTURE_UAV_ARRAY(RWTexture2D<float>, FurthestHZBOutput, [kMaxMipBatchSize])
 		SHADER_PARAMETER_RDG_TEXTURE_UAV_ARRAY(RWTexture2D<float>, ClosestHZBOutput, [kMaxMipBatchSize])
 	END_SHADER_PARAMETER_STRUCT()
@@ -73,50 +79,66 @@ class FHZBBuildCS : public FGlobalShader
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
 		FPermutationDomain PermutationVector(Parameters.PermutationId);
-
+		
+		// No need for froxels on non-VSM platforms
+		if (PermutationVector.Get<FDimFroxels>() && !DoesPlatformSupportVirtualShadowMaps(Parameters.Platform))
+		{
+			return false;
+		}
 		// Necessarily reduce at least closest of furthest.
 		if (!PermutationVector.Get<FDimFurthest>() && !PermutationVector.Get<FDimClosest>())
 		{
 			return false;
 		}
 
-
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		return true;
 	}
 };
 
 IMPLEMENT_GLOBAL_SHADER(FHZBBuildPS, "/Engine/Private/HZB.usf", "HZBBuildPS", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FHZBBuildCS, "/Engine/Private/HZB.usf", "HZBBuildCS", SF_Compute);
 
-
-bool ShouldRenderScreenSpaceDiffuseIndirect(const FViewInfo& View);
-
-static bool RequireClosestDepthHZB(const FViewInfo& View)
+static bool HZBBuildUseCompute(EShaderPlatform ShaderPlatform)
 {
-	return ShouldRenderScreenSpaceDiffuseIndirect(View);
+	if (IsMobilePlatform(ShaderPlatform))
+	{
+		return false;
+	}
+	else
+	{
+		return CVarHZBBuildUseCompute.GetValueOnRenderThread() == 1;
+	}
 }
 
-void BuildHZB(FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTextures, FViewInfo& View)
+void BuildHZB(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef SceneDepth,
+	FRDGTextureRef VisBufferTexture,
+	const FIntRect ViewRect,
+	ERHIFeatureLevel::Type FeatureLevel,
+	EShaderPlatform ShaderPlatform,
+	const TCHAR* ClosestHZBName,
+	FRDGTextureRef* OutClosestHZBTexture,
+	const TCHAR* FurthestHZBName,
+	FRDGTextureRef* OutFurthestHZBTexture,
+	EPixelFormat Format,
+	const FBuildHZBAsyncComputeParams* AsyncComputeParams,
+	const Froxel::FViewData* OutFroxelViewData)
 {
+	RDG_EVENT_SCOPE(GraphBuilder, "BuildHZB");
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_BuildHZB);
 
 	FIntPoint HZBSize;
-	int32 NumMips;
-	{
-		const int32 NumMipsX = FMath::Max(FPlatformMath::CeilToInt(FMath::Log2(float(View.ViewRect.Width()))) - 1, 1);
-		const int32 NumMipsY = FMath::Max(FPlatformMath::CeilToInt(FMath::Log2(float(View.ViewRect.Height()))) - 1, 1);
+	HZBSize.X = FMath::Max( FPlatformMath::RoundUpToPowerOfTwo( ViewRect.Width() ) >> 1, 1u );
+	HZBSize.Y = FMath::Max( FPlatformMath::RoundUpToPowerOfTwo( ViewRect.Height() ) >> 1, 1u );
 
-		NumMips = FMath::Max(NumMipsX, NumMipsY);
+	int32 NumMips = FMath::Max(FMath::FloorToInt(FMath::Log2(FMath::Max<float>(HZBSize.X, HZBSize.Y))), 1);
 
-		// Must be power of 2
-		HZBSize = FIntPoint(1 << NumMipsX, 1 << NumMipsY);
-	}
-
-	bool bReduceClosestDepth = RequireClosestDepthHZB(View);
-	bool bUseCompute = bReduceClosestDepth || CVarHZBBuildUseCompute.GetValueOnRenderThread();
+	bool bReduceClosestDepth = OutClosestHZBTexture != nullptr;
+	bool bUseCompute = bReduceClosestDepth || HZBBuildUseCompute(ShaderPlatform);
 
 	FRDGTextureDesc HZBDesc = FRDGTextureDesc::Create2D(
-		HZBSize, PF_R16F,
+		HZBSize, Format,
 		FClearValueBinding::None,
 		TexCreate_ShaderResource | (bUseCompute ? TexCreate_UAV : TexCreate_RenderTargetable),
 		NumMips);
@@ -125,29 +147,30 @@ void BuildHZB(FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTex
 	/** Closest and furthest HZB are intentionally in separate render target, because majority of the case you only one or the other.
 	 * Keeping them separate avoid doubling the size in cache for this cases, to avoid performance regression.
 	 */
-	FRDGTextureRef FurthestHZBTexture = GraphBuilder.CreateTexture(HZBDesc, TEXT("HZBFurthest"));
+	FRDGTextureRef FurthestHZBTexture = GraphBuilder.CreateTexture(HZBDesc, FurthestHZBName);
 
 	FRDGTextureRef ClosestHZBTexture = nullptr;
 	if (bReduceClosestDepth)
 	{
-		ClosestHZBTexture = GraphBuilder.CreateTexture(HZBDesc, TEXT("HZBClosest"));
+		ClosestHZBTexture = GraphBuilder.CreateTexture(HZBDesc, ClosestHZBName);
 	}
 
 	int32 MaxMipBatchSize = bUseCompute ? FHZBBuildCS::kMaxMipBatchSize : 1;
 
 	auto ReduceMips = [&](
-		FRDGTextureSRVRef ParentTextureMip, int32 StartDestMip, FVector4 DispatchThreadIdToBufferUV, FVector2D InputViewportMaxBound,
-		bool bOutputClosest, bool bOutputFurthest)
+		FRDGTextureSRVRef ParentTextureMip, FIntPoint SrcSize,
+		int32 StartDestMip, FVector4f DispatchThreadIdToBufferUV, FVector2D InputViewportMaxBound,
+		FIntVector4 PixelViewPortMinMax, bool bOutputClosest, bool bOutputFurthest, bool bProduceFroxelData)
 	{
-		FIntPoint SrcSize = FIntPoint::DivideAndRoundUp(ParentTextureMip->Desc.Texture->Desc.Extent, 1 << int32(ParentTextureMip->Desc.MipLevel));
 
 		FSharedHZBParameters ShaderParameters;
-		ShaderParameters.InvSize = FVector2D(1.0f / SrcSize.X, 1.0f / SrcSize.Y);
-		ShaderParameters.InputViewportMaxBound = InputViewportMaxBound;
+		ShaderParameters.InvSize = FVector2f(1.0f / SrcSize.X, 1.0f / SrcSize.Y);
+		ShaderParameters.InputViewportMaxBound = FVector2f(InputViewportMaxBound);	// LWC_TODO: Precision loss
 		ShaderParameters.DispatchThreadIdToBufferUV = DispatchThreadIdToBufferUV;
+		ShaderParameters.PixelViewPortMinMax = PixelViewPortMinMax;
+		ShaderParameters.VisBufferTexture = VisBufferTexture;
 		ShaderParameters.ParentTextureMip = ParentTextureMip;
 		ShaderParameters.ParentTextureMipSampler = TStaticSamplerState<SF_Point>::GetRHI();
-		ShaderParameters.View = View.ViewUniformBuffer;
 
 		FIntPoint DstSize = FIntPoint::DivideAndRoundUp(HZBSize, 1 << StartDestMip);
 
@@ -161,43 +184,88 @@ void BuildHZB(FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTex
 			for (int32 DestMip = StartDestMip; DestMip < EndDestMip; DestMip++)
 			{
 				if (bOutputFurthest)
+				{
 					PassParameters->FurthestHZBOutput[DestMip - StartDestMip] = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(FurthestHZBTexture, DestMip));
+				}
 				if (bOutputClosest)
+				{
 					PassParameters->ClosestHZBOutput[DestMip - StartDestMip] = GraphBuilder.CreateUAV(FRDGTextureUAVDesc(ClosestHZBTexture, DestMip));
+				}
+			}
+
+			int32 VisBufferFormat = 0;
+			if( VisBufferTexture && StartDestMip == 0 )
+			{
+				const int32 VisBufferFormatR32G32 = 1;
+				const int32 VisBufferFormatR32 = 2;
+				const int32 VisBufferFormatR64 = 3;
+
+				if (VisBufferTexture->Desc.Format == PF_R32_UINT)
+				{
+					VisBufferFormat = VisBufferFormatR32;
+				}
+				else if (VisBufferTexture->Desc.Format == PF_R64_UINT)
+				{
+					// Vulkan uses a single UlongType that can't be viewed as a R32G32
+					VisBufferFormat = VisBufferFormatR64;
+				}
+				else
+				{
+					VisBufferFormat = VisBufferFormatR32G32;
+				}
+			}
+
+			if (bProduceFroxelData)
+			{
+				PassParameters->FroxelBuilder = OutFroxelViewData->GetBuilderParameters(GraphBuilder);
 			}
 
 			FHZBBuildCS::FPermutationDomain PermutationVector;
 			PermutationVector.Set<FHZBBuildCS::FDimMipLevelCount>(EndDestMip - StartDestMip);
 			PermutationVector.Set<FHZBBuildCS::FDimFurthest>(bOutputFurthest);
 			PermutationVector.Set<FHZBBuildCS::FDimClosest>(bOutputClosest);
+			PermutationVector.Set<FHZBBuildCS::FDimFroxels>(bProduceFroxelData);
+			PermutationVector.Set<FHZBBuildCS::FDimVisBufferFormat>(VisBufferFormat);
 
-			TShaderMapRef<FHZBBuildCS> ComputeShader(View.ShaderMap, PermutationVector);
+			const bool bAsyncCompute = AsyncComputeParams != nullptr;
+			const ERDGPassFlags PassFlags = bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute;
 
-			FComputeShaderUtils::AddPass(
+			TShaderMapRef<FHZBBuildCS> ComputeShader(GetGlobalShaderMap(FeatureLevel), PermutationVector);
+			FRDGPassRef ReduceHZBPass = FComputeShaderUtils::AddPass(
 				GraphBuilder,
-				RDG_EVENT_NAME("ReduceHZB(mips=[%d;%d]%s%s) %dx%d",
+				RDG_EVENT_NAME("ReduceHZB(mips=[%d;%d]%s%s%s) %dx%d",
 					StartDestMip, EndDestMip - 1,
 					bOutputClosest ? TEXT(" Closest") : TEXT(""),
 					bOutputFurthest ? TEXT(" Furthest") : TEXT(""),
+					bProduceFroxelData ? TEXT(" Froxels") : TEXT(""),
 					DstSize.X, DstSize.Y),
+				PassFlags,
 				ComputeShader,
 				PassParameters,
 				FComputeShaderUtils::GetGroupCount(DstSize, 8));
+
+			if (AsyncComputeParams && AsyncComputeParams->Prerequisite)
+			{
+				GraphBuilder.AddPassDependency(AsyncComputeParams->Prerequisite, ReduceHZBPass);
+			}
 		}
 		else
 		{
+			check(!bProduceFroxelData);
 			check(bOutputFurthest);
 			check(!bOutputClosest);
 
 			FHZBBuildPS::FParameters* PassParameters = GraphBuilder.AllocParameters<FHZBBuildPS::FParameters>();
 			PassParameters->Shared = ShaderParameters;
+			PassParameters->SourceMipIndex = GRHISupportsTextureViews ? 0 : StartDestMip - 1;
 			PassParameters->RenderTargets[0] = FRenderTargetBinding(FurthestHZBTexture, ERenderTargetLoadAction::ENoAction, StartDestMip);
 
-			TShaderMapRef<FHZBBuildPS> PixelShader(View.ShaderMap);
+			FGlobalShaderMap* GlobalShaderMap = GetGlobalShaderMap(FeatureLevel);
+			TShaderMapRef<FHZBBuildPS> PixelShader(GlobalShaderMap);
 
 			FPixelShaderUtils::AddFullscreenPass(
 				GraphBuilder,
-				View.ShaderMap,
+				GlobalShaderMap,
 				RDG_EVENT_NAME("DownsampleHZB(mip=%d) %dx%d", StartDestMip, DstSize.X, DstSize.Y),
 				PixelShader,
 				PassParameters,
@@ -205,26 +273,29 @@ void BuildHZB(FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTex
 		}
 	};
 
-	// Reduce first mips Closesy and furtherest are done at same time.
+	// Reduce first mips Closest and furtherest are done at same time.
 	{
-		FIntPoint SrcSize = SceneTextures.SceneDepthTexture->Desc.Extent;
-
-		FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneTextures.SceneDepthTexture));
-
-		FVector4 DispatchThreadIdToBufferUV;
+		FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneDepth));
+		FIntPoint SrcSize = VisBufferTexture ? VisBufferTexture->Desc.Extent : ParentTextureMip->Desc.Texture->Desc.Extent;
+		
+		FVector4f DispatchThreadIdToBufferUV;
 		DispatchThreadIdToBufferUV.X = 2.0f / float(SrcSize.X);
 		DispatchThreadIdToBufferUV.Y = 2.0f / float(SrcSize.Y);
-		DispatchThreadIdToBufferUV.Z = View.ViewRect.Min.X / float(SrcSize.X);
-		DispatchThreadIdToBufferUV.W = View.ViewRect.Min.Y / float(SrcSize.Y);
+		DispatchThreadIdToBufferUV.Z = ViewRect.Min.X / float(SrcSize.X);
+		DispatchThreadIdToBufferUV.W = ViewRect.Min.Y / float(SrcSize.Y);
 
 		FVector2D InputViewportMaxBound = FVector2D(
-			float(View.ViewRect.Max.X - 0.5f) / float(SrcSize.X),
-			float(View.ViewRect.Max.Y - 0.5f) / float(SrcSize.Y));
+			float(ViewRect.Max.X - 0.5f) / float(SrcSize.X),
+			float(ViewRect.Max.Y - 0.5f) / float(SrcSize.Y));
+		FIntVector4 PixelViewPortMinMax = FIntVector4(
+			ViewRect.Min.X, ViewRect.Min.Y, 
+			ViewRect.Max.X - 1, ViewRect.Max.Y - 1);
 
 		ReduceMips(
-			ParentTextureMip,
-			/* StartDestMip = */ 0, DispatchThreadIdToBufferUV, InputViewportMaxBound,
-			/* bOutputClosest = */ bReduceClosestDepth, /* bOutputFurthest = */ true);
+			ParentTextureMip, SrcSize,
+			/* StartDestMip = */ 0, DispatchThreadIdToBufferUV, InputViewportMaxBound, PixelViewPortMinMax,
+			/* bOutputClosest = */ bReduceClosestDepth, /* bOutputFurthest = */ true,
+			OutFroxelViewData != nullptr);
 	}
 
 	// Reduce the next mips
@@ -232,38 +303,65 @@ void BuildHZB(FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTex
 	{
 		FIntPoint SrcSize = FIntPoint::DivideAndRoundUp(HZBSize, 1 << int32(StartDestMip - 1));
 
-		FVector4 DispatchThreadIdToBufferUV;
+		FVector4f DispatchThreadIdToBufferUV;
 		DispatchThreadIdToBufferUV.X = 2.0f / float(SrcSize.X);
 		DispatchThreadIdToBufferUV.Y = 2.0f / float(SrcSize.Y);
 		DispatchThreadIdToBufferUV.Z = 0.0f;
 		DispatchThreadIdToBufferUV.W = 0.0f;
 
 		FVector2D InputViewportMaxBound(1.0f, 1.0f);
+		FIntVector4 PixelViewPortMinMax = FIntVector4(0, 0, SrcSize.X - 1, SrcSize.Y - 1);
 		
 		{
-			FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(FurthestHZBTexture, StartDestMip - 1));
-			ReduceMips(ParentTextureMip,
-				StartDestMip, DispatchThreadIdToBufferUV, InputViewportMaxBound,
-				/* bOutputClosest = */ false, /* bOutputFurthest = */ true);
+			FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(GRHISupportsTextureViews ? FRDGTextureSRVDesc::CreateForMipLevel(FurthestHZBTexture, StartDestMip - 1) : FRDGTextureSRVDesc::Create(FurthestHZBTexture));
+			ReduceMips(ParentTextureMip, SrcSize,
+				StartDestMip, DispatchThreadIdToBufferUV, InputViewportMaxBound, PixelViewPortMinMax,
+				/* bOutputClosest = */ false, /* bOutputFurthest = */ true, false);
 		}
 
 		if (bReduceClosestDepth)
 		{
 			check(ClosestHZBTexture)
-			FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::CreateForMipLevel(ClosestHZBTexture, StartDestMip - 1));
-			ReduceMips(ParentTextureMip,
-				StartDestMip, DispatchThreadIdToBufferUV, InputViewportMaxBound,
-				/* bOutputClosest = */ true, /* bOutputFurthest = */ false);
+			FRDGTextureSRVRef ParentTextureMip = GraphBuilder.CreateSRV(GRHISupportsTextureViews ? FRDGTextureSRVDesc::CreateForMipLevel(ClosestHZBTexture, StartDestMip - 1) : FRDGTextureSRVDesc::Create(ClosestHZBTexture));
+			ReduceMips(ParentTextureMip, SrcSize,
+				StartDestMip, DispatchThreadIdToBufferUV, InputViewportMaxBound, PixelViewPortMinMax,
+				/* bOutputClosest = */ true, /* bOutputFurthest = */ false, false);
 		}
 	}
 
-	// Update the view.
-	View.HZBMipmap0Size = HZBSize;
+	check(OutFurthestHZBTexture);
+	*OutFurthestHZBTexture = FurthestHZBTexture;
 
-	ConvertToExternalTexture(GraphBuilder, FurthestHZBTexture, View.HZB);
-
-	if (ClosestHZBTexture)
+	if (OutClosestHZBTexture)
 	{
-		ConvertToExternalTexture(GraphBuilder, ClosestHZBTexture, View.ClosestHZB);
+		*OutClosestHZBTexture = ClosestHZBTexture;
 	}
+}
+
+void BuildHZBFurthest(
+	FRDGBuilder& GraphBuilder,
+	FRDGTextureRef SceneDepth,
+	FRDGTextureRef VisBufferTexture,
+	const FIntRect ViewRect,
+	ERHIFeatureLevel::Type FeatureLevel,
+	EShaderPlatform ShaderPlatform,
+	const TCHAR* FurthestHZBName,
+	FRDGTextureRef* OutFurthestHZBTexture,
+	EPixelFormat Format,
+	const FBuildHZBAsyncComputeParams* AsyncComputeParams
+)
+{
+	BuildHZB(
+		GraphBuilder,
+		SceneDepth,
+		VisBufferTexture,
+		ViewRect,
+		FeatureLevel,
+		ShaderPlatform,
+		TEXT("HZBClosest"),
+		nullptr,
+		FurthestHZBName,
+		OutFurthestHZBTexture,
+		Format,
+		AsyncComputeParams);
 }

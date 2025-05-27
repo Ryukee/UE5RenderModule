@@ -8,6 +8,7 @@
 #pragma once
 
 #include "CoreFwd.h"
+#include "BasePassRendering.h"
 
 class FMeshMaterialShader;
 class FPrimitiveSceneProxy;
@@ -26,21 +27,10 @@ void TBasePassVertexShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings
 	const FPrimitiveSceneProxy* PrimitiveSceneProxy,
 	const FMaterialRenderProxy& MaterialRenderProxy,
 	const FMaterial& Material,
-	const FMeshPassProcessorRenderState& DrawRenderState,
 	const TBasePassShaderElementData<LightMapPolicyType>& ShaderElementData,
 	FMeshDrawSingleShaderBindings& ShaderBindings) const
 {
-	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, DrawRenderState, ShaderElementData, ShaderBindings);
-
-	if (Scene)
-	{
-		FRHIUniformBuffer* ReflectionCaptureUniformBuffer = Scene->UniformBuffers.ReflectionCaptureUniformBuffer.GetReference();
-		ShaderBindings.Add(ReflectionCaptureBuffer, ReflectionCaptureUniformBuffer);
-	}
-	else
-	{
-		ShaderBindings.Add(ReflectionCaptureBuffer, DrawRenderState.GetReflectionCaptureUniformBuffer());
-	}
+	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, ShaderElementData, ShaderBindings);
 
 	LightMapPolicyType::GetVertexShaderBindings(
 		PrimitiveSceneProxy,
@@ -74,25 +64,62 @@ void TBasePassPixelShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings(
 	const FPrimitiveSceneProxy* PrimitiveSceneProxy,
 	const FMaterialRenderProxy& MaterialRenderProxy,
 	const FMaterial& Material,
-	const FMeshPassProcessorRenderState& DrawRenderState,
 	const TBasePassShaderElementData<LightMapPolicyType>& ShaderElementData,
 	FMeshDrawSingleShaderBindings& ShaderBindings) const
 {
-	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, DrawRenderState, ShaderElementData, ShaderBindings);
-
-	if (Scene)
-	{
-		FRHIUniformBuffer* ReflectionCaptureUniformBuffer = Scene->UniformBuffers.ReflectionCaptureUniformBuffer.GetReference();
-		ShaderBindings.Add(ReflectionCaptureBuffer, ReflectionCaptureUniformBuffer);
-	}
-	else
-	{
-		ShaderBindings.Add(ReflectionCaptureBuffer, DrawRenderState.GetReflectionCaptureUniformBuffer());
-	}
+	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, ShaderElementData, ShaderBindings);
 
 	LightMapPolicyType::GetPixelShaderBindings(
 		PrimitiveSceneProxy,
 		ShaderElementData.LightMapPolicyElementData,
 		this,
 		ShaderBindings);
+}
+
+template<typename LightMapPolicyType>
+void TBasePassComputeShaderPolicyParamType<LightMapPolicyType>::GetShaderBindings(
+	const FScene* Scene,
+	ERHIFeatureLevel::Type FeatureLevel,
+	const FPrimitiveSceneProxy* PrimitiveSceneProxy,
+	const FMaterialRenderProxy& MaterialRenderProxy,
+	const FMaterial& Material,
+	const TBasePassShaderElementData<LightMapPolicyType>& ShaderElementData,
+	FMeshDrawSingleShaderBindings& ShaderBindings) const
+{
+	FMeshMaterialShader::GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, Material, ShaderElementData, ShaderBindings);
+
+	LightMapPolicyType::GetComputeShaderBindings(
+		PrimitiveSceneProxy,
+		ShaderElementData.LightMapPolicyElementData,
+		this,
+		ShaderBindings);
+}
+
+template<typename LightMapPolicyType>
+void TBasePassComputeShaderPolicyParamType<LightMapPolicyType>::SetPassParameters(
+	FRHIBatchedShaderParameters& BatchedParameters,
+	const FUintVector4& ViewRect,
+	const FUintVector4& PassData,
+	FRHIUniformBuffer* ShadingOutputs
+)
+{
+	SetUniformBufferParameter(BatchedParameters, ShadingOutputsParam, ShadingOutputs);
+	SetShaderValue(BatchedParameters, ViewRectParam, ViewRect);
+	SetShaderValue(BatchedParameters, PassDataParam, PassData);
+}
+
+template<typename LightMapPolicyType>
+uint32 TBasePassComputeShaderPolicyParamType<LightMapPolicyType>::GetBoundTargetMask() const
+{
+	uint32 TargetMask = 0u;
+	TargetMask |= Target0.IsBound() ? (1u << 0u) : 0u;
+	TargetMask |= Target1.IsBound() ? (1u << 1u) : 0u;
+	TargetMask |= Target2.IsBound() ? (1u << 2u) : 0u;
+	TargetMask |= Target3.IsBound() ? (1u << 3u) : 0u;
+	TargetMask |= Target4.IsBound() ? (1u << 4u) : 0u;
+	TargetMask |= Target5.IsBound() ? (1u << 5u) : 0u;
+	TargetMask |= Target6.IsBound() ? (1u << 6u) : 0u;
+	TargetMask |= Target7.IsBound() ? (1u << 7u) : 0u;
+	TargetMask |= Targets.IsBound() ? (1u << 8u) : 0u;
+	return TargetMask;
 }

@@ -6,12 +6,15 @@
 
 #pragma once
 
+#include "MeshMaterialShaderType.h"
+#include "MaterialShader.h"
+
+#if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_2
 #include "CoreMinimal.h"
 #include "ShaderParameters.h"
 #include "VertexFactory.h"
-#include "MeshMaterialShaderType.h"
-#include "MaterialShader.h"
 #include "MeshDrawShaderBindings.h"
+#endif
 
 class FPrimitiveSceneProxy;
 struct FMeshBatchElement;
@@ -26,7 +29,9 @@ public:
 	FRHIUniformBuffer* FadeUniformBuffer = nullptr;
 	FRHIUniformBuffer* DitherUniformBuffer = nullptr;
 
+	RENDERER_API void InitializeMeshMaterialData();
 	RENDERER_API void InitializeMeshMaterialData(const FSceneView* SceneView, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, const FMeshBatch& RESTRICT MeshBatch, int32 StaticMeshId, bool bAllowStencilDither);
+	RENDERER_API void InitializeMeshMaterialData(const FSceneView* SceneView, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, int32 StaticMeshId, bool bDitheredLODTransition, bool bAllowStencilDither);
 };
 
 struct FMeshMaterialShaderPermutationParameters : public FMaterialShaderPermutationParameters
@@ -34,37 +39,57 @@ struct FMeshMaterialShaderPermutationParameters : public FMaterialShaderPermutat
 	// Type of vertex factory to compile.
 	const FVertexFactoryType* VertexFactoryType;
 
-	FMeshMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType, const int32 InPermutationId)
-		: FMaterialShaderPermutationParameters(InPlatform, InMaterialParameters, InPermutationId)
+	FMeshMaterialShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType, int32 InPermutationId, EShaderPermutationFlags InFlags)
+		: FMaterialShaderPermutationParameters(InPlatform, InMaterialParameters, InPermutationId, InFlags)
 		, VertexFactoryType(InVertexFactoryType)
 	{}
 };
 
 struct FVertexFactoryShaderPermutationParameters
 {
-	EShaderPlatform Platform;
-	FMaterialShaderParameters MaterialParameters;
+	const FShaderType* ShaderType;
 	const FVertexFactoryType* VertexFactoryType;
+	FMaterialShaderParameters MaterialParameters;
+	EShaderPlatform Platform;
+	EShaderPermutationFlags Flags;
 
-	FVertexFactoryShaderPermutationParameters(EShaderPlatform InPlatform, const FMaterialShaderParameters& InMaterialParameters, const FVertexFactoryType* InVertexFactoryType)
-		: Platform(InPlatform)
-		, MaterialParameters(InMaterialParameters)
+	FVertexFactoryShaderPermutationParameters(
+		EShaderPlatform InPlatform,
+		const FMaterialShaderParameters& InMaterialParameters, 
+		const FVertexFactoryType* InVertexFactoryType,
+		const FShaderType* InShaderType,
+		EShaderPermutationFlags InFlags
+		)
+		: ShaderType(InShaderType)
 		, VertexFactoryType(InVertexFactoryType)
+		, MaterialParameters(InMaterialParameters)
+		, Platform(InPlatform)
+		, Flags(InFlags)
 	{}
 };
 
 /** Base class of all shaders that need material and vertex factory parameters. */
-class RENDERER_API FMeshMaterialShader : public FMaterialShader
+class FMeshMaterialShader : public FMaterialShader
 {
-	DECLARE_TYPE_LAYOUT(FMeshMaterialShader, NonVirtual);
+	DECLARE_EXPORTED_TYPE_LAYOUT(FMeshMaterialShader, RENDERER_API, NonVirtual);
 public:
 	using FPermutationParameters = FMeshMaterialShaderPermutationParameters;
 	using ShaderMetaType = FMeshMaterialShaderType;
 
 	FMeshMaterialShader() {}
 
-	FMeshMaterialShader(const FMeshMaterialShaderType::CompiledShaderInitializerType& Initializer);
+	RENDERER_API FMeshMaterialShader(const FMeshMaterialShaderType::CompiledShaderInitializerType& Initializer);
 
+	RENDERER_API void GetShaderBindings(
+		const FScene* Scene,
+		ERHIFeatureLevel::Type FeatureLevel,
+		const FPrimitiveSceneProxy* PrimitiveSceneProxy,
+		const FMaterialRenderProxy& MaterialRenderProxy,
+		const FMaterial& Material,
+		const FMeshMaterialShaderElementData& ShaderElementData,
+		FMeshDrawSingleShaderBindings& ShaderBindings) const;
+
+	UE_DEPRECATED(5.4, "GetShaderBindings no longer has a DrawRenderState argument. Please update your shader type to use the new function signature to ensure it is set up correctly.")
 	void GetShaderBindings(
 		const FScene* Scene,
 		ERHIFeatureLevel::Type FeatureLevel,
@@ -73,9 +98,12 @@ public:
 		const FMaterial& Material,
 		const FMeshPassProcessorRenderState& DrawRenderState,
 		const FMeshMaterialShaderElementData& ShaderElementData,
-		FMeshDrawSingleShaderBindings& ShaderBindings) const;
+		FMeshDrawSingleShaderBindings& ShaderBindings) const
+	{
+		checkNoEntry();
+	}
 
-	void GetElementShaderBindings(
+	RENDERER_API void GetElementShaderBindings(
 		const FShaderMapPointerTable& PointerTable,
 		const FScene* Scene, 
 		const FSceneView* ViewIfDynamicMeshCommand, 
@@ -107,9 +135,10 @@ public:
 	}
 
 private:
-	void WriteFrozenVertexFactoryParameters(FMemoryImageWriter& Writer, const TMemoryImagePtr<FVertexFactoryShaderParameters>& InVertexFactoryParameters) const;
+	RENDERER_API void WriteFrozenVertexFactoryParameters(FMemoryImageWriter& Writer, const TMemoryImagePtr<FVertexFactoryShaderParameters>& InVertexFactoryParameters) const;
 	LAYOUT_FIELD_WITH_WRITER(TMemoryImagePtr<FVertexFactoryShaderParameters>, VertexFactoryParameters, WriteFrozenVertexFactoryParameters);
 
 protected:
 	LAYOUT_FIELD(FShaderUniformBufferParameter, PassUniformBuffer);
 };
+

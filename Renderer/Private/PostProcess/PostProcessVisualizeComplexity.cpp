@@ -2,8 +2,10 @@
 
 #include "PostProcess/PostProcessVisualizeComplexity.h"
 #include "CanvasTypes.h"
-#include "RenderTargetTemp.h"
 #include "UnrealEngine.h"
+#include "SceneRendering.h"
+#include "SystemTextures.h"
+#include "DataDrivenShaderPlatformInfo.h"
 
 class FVisualizeComplexityApplyPS : public FGlobalShader
 {
@@ -13,6 +15,7 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT(FScreenPassTextureViewportParameters, Input)
+		SHADER_PARAMETER_STRUCT(FScreenPassTextureViewportParameters, Output)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint>, QuadOverdrawTexture)
@@ -62,6 +65,7 @@ public:
 		OutEnvironment.SetDefine(TEXT("DVSM_ShaderComplexityContainedQuadOverhead"), (uint32)DVSM_ShaderComplexityContainedQuadOverhead);
 		OutEnvironment.SetDefine(TEXT("DVSM_ShaderComplexityBleedingQuadOverhead"), (uint32)DVSM_ShaderComplexityBleedingQuadOverhead);
 		OutEnvironment.SetDefine(TEXT("DVSM_QuadComplexity"), (uint32)DVSM_QuadComplexity);
+		OutEnvironment.SetDefine(TEXT("DVSM_LWCComplexity"), (uint32)DVSM_LWCComplexity);
 	}
 };
 
@@ -90,10 +94,12 @@ FScreenPassTexture AddVisualizeComplexityPass(FRDGBuilder& GraphBuilder, const F
 	}
 
 	const FScreenPassTextureViewport InputViewport(Inputs.SceneColor);
+	const FScreenPassTextureViewport OutputViewport(Output);
 
 	FVisualizeComplexityApplyPS::FParameters* PassParameters = GraphBuilder.AllocParameters<FVisualizeComplexityApplyPS::FParameters>();
 	PassParameters->RenderTargets[0] = Output.GetRenderTargetBinding();
 	PassParameters->Input = GetScreenPassTextureViewportParameters(InputViewport);
+	PassParameters->Output = GetScreenPassTextureViewportParameters(OutputViewport);
 	PassParameters->InputTexture = Inputs.SceneColor.Texture;
 	PassParameters->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
@@ -118,17 +124,23 @@ FScreenPassTexture AddVisualizeComplexityPass(FRDGBuilder& GraphBuilder, const F
 
 	PassParameters->MiniFontTexture = GetMiniFontTexture();
 
-	const FSceneRenderTargets& SceneRenderTargets = FSceneRenderTargets::Get(GraphBuilder.RHICmdList);
+	const FSceneTextures& SceneTextures = View.GetSceneTextures();
 	const EDebugViewShaderMode DebugViewShaderMode = View.Family->GetDebugViewShaderMode();
 
 	PassParameters->DebugViewShaderMode = DVSM_ShaderComplexity;
 	FVisualizeComplexityApplyPS::EQuadOverdraw QuadOverdrawEnum = FVisualizeComplexityApplyPS::EQuadOverdraw::Disable;
 
-	if (SceneRenderTargets.QuadOverdrawBuffer && AllowDebugViewShaderMode(DVSM_QuadComplexity, View.GetShaderPlatform(), View.FeatureLevel))
+	if (SceneTextures.QuadOverdraw)
 	{
-		PassParameters->QuadOverdrawTexture = GraphBuilder.RegisterExternalTexture(SceneRenderTargets.QuadOverdrawBuffer);
+		const FRDGSystemTextures& SystemTextures = FRDGSystemTextures::Get(GraphBuilder);
+		PassParameters->QuadOverdrawTexture = HasBeenProduced(SceneTextures.QuadOverdraw) ? SceneTextures.QuadOverdraw : GSystemTextures.GetZeroUIntDummy(GraphBuilder);
 		PassParameters->DebugViewShaderMode = DebugViewShaderMode;
 		QuadOverdrawEnum = FVisualizeComplexityApplyPS::EQuadOverdraw::Enable;
+	}
+
+	if (DebugViewShaderMode == DVSM_LWCComplexity)
+	{
+		PassParameters->DebugViewShaderMode = DVSM_LWCComplexity;
 	}
 
 	PassParameters->bLegend = Inputs.bDrawLegend;
@@ -150,29 +162,49 @@ FScreenPassTexture AddVisualizeComplexityPass(FRDGBuilder& GraphBuilder, const F
 	AddDrawCanvasPass(GraphBuilder, RDG_EVENT_NAME("Overlay"), View, Output,
 		[Output, &View, ShaderComplexityColorCount](FCanvas& Canvas)
 	{
+		const float DPIScale = Canvas.GetDPIScale();
+		Canvas.SetBaseTransform(FMatrix(FScaleMatrix(DPIScale)* Canvas.CalcBaseTransform2D(Canvas.GetViewRect().Width(), Canvas.GetViewRect().Height())));
+
+		auto DrawString = [&](int X, int Y, const TCHAR* Text, const FLinearColor& Color = FLinearColor(0.5f, 0.5f, 0.5f)){
+			Canvas.DrawShadowedString(X / DPIScale, Y / DPIScale, Text, GetStatsFont(), Color);
+		};
+
+		const FIntPoint CanvasMin(0, 0);
+		const FIntPoint CanvasMax = Output.ViewRect.Max - Output.ViewRect.Min;
+
 		if (View.Family->GetDebugViewShaderMode() == DVSM_QuadComplexity)
 		{
-			int32 StartX = Output.ViewRect.Min.X + 62;
-			int32 EndX = Output.ViewRect.Max.X - 66;
+			int32 StartX = CanvasMin.X + 62;
+			int32 EndX = CanvasMax.X - 66;
 			int32 NumOffset = (EndX - StartX) / (ShaderComplexityColorCount - 1);
 			for (int32 PosX = StartX, Number = 0; PosX <= EndX; PosX += NumOffset, ++Number)
 			{
 				FString Line;
 				Line = FString::Printf(TEXT("%d"), Number);
-				Canvas.DrawShadowedString(PosX, Output.ViewRect.Max.Y - 87, *Line, GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
+				DrawString(PosX, CanvasMax.Y - 87, *Line);
 			}
 		}
 		else
 		{
-			Canvas.DrawShadowedString(Output.ViewRect.Min.X + 63, Output.ViewRect.Max.Y - 51, TEXT("Good"), GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
-			Canvas.DrawShadowedString(Output.ViewRect.Min.X + 63 + (int32)(Output.ViewRect.Width() * 107.0f / 397.0f), Output.ViewRect.Max.Y - 51, TEXT("Bad"), GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
-			Canvas.DrawShadowedString(Output.ViewRect.Max.X - 162, Output.ViewRect.Max.Y - 51, TEXT("Extremely bad"), GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
+			DrawString(CanvasMin.X + 63, CanvasMax.Y - 51, TEXT("Good"));
+			DrawString(CanvasMin.X + 63 + (int32)(Output.ViewRect.Width() * 107.0f / 397.0f), CanvasMax.Y - 51, TEXT("Bad"));
+			DrawString(CanvasMax.X - 170, CanvasMax.Y - 51, TEXT("Extremely bad"));
 
-			Canvas.DrawShadowedString(Output.ViewRect.Min.X + 62, Output.ViewRect.Max.Y - 87, TEXT("0"), GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
+			DrawString(CanvasMin.X + 62, CanvasMax.Y - 87, TEXT("0"));
 
-			FString Line;
-			Line = FString::Printf(TEXT("MaxShaderComplexityCount=%d"), (int32)GetMaxShaderComplexityCount(View.GetFeatureLevel()));
-			Canvas.DrawShadowedString(Output.ViewRect.Max.X - 260, Output.ViewRect.Max.Y - 88, *Line, GetStatsFont(), FLinearColor(0.5f, 0.5f, 0.5f));
+			if (View.Family->GetDebugViewShaderMode() == DVSM_LWCComplexity)
+			{
+#if WITH_DEBUG_VIEW_MODES
+				extern float GMaxLWCComplexity;
+				FString Line = FString::Printf(TEXT("r.ShaderComplexity.MaxLWCComplexity=%d"), (int32)GMaxLWCComplexity);
+				DrawString(CanvasMax.X - 430, CanvasMax.Y - 88, *Line);
+#endif
+			}
+			else
+			{
+				FString Line = FString::Printf(TEXT("MaxShaderComplexityCount=%d"), (int32)GetMaxShaderComplexityCount(View.GetFeatureLevel()));
+				DrawString(CanvasMax.X - 330, CanvasMax.Y - 88, *Line);
+			}
 		}
 	});
 

@@ -8,43 +8,70 @@
 
 #include "RHIValidationCommon.h"
 #include "RHIValidationUtils.h"
+#include "RHIValidation.h"
 
 #if ENABLE_RHI_VALIDATION
+
+#include "RHI.h"
+
 class FValidationRHI;
 
-class FValidationComputeContext : public IRHIComputeContext
+void ValidateShaderParameters(FRHIShader* RHIShader, RHIValidation::FTracker* Tracker, RHIValidation::FStaticUniformBuffers& StaticUniformBuffers, RHIValidation::FStageBoundUniformBuffers& BoundUniformBuffers, TConstArrayView<FRHIShaderParameterResource> InParameters, ERHIAccess InRequiredAccess, RHIValidation::EUAVMode InRequiredUAVMode);
+
+class FValidationComputeContext final : public IRHIComputeContext
 {
 public:
-	FValidationComputeContext();
+	enum EType
+	{
+		Default,
+		Parallel
+	} const Type;
+
+	FValidationComputeContext(EType Type);
+
+	void ValidateDispatch();
 
 	virtual ~FValidationComputeContext()
 	{
 	}
 
-	/**
-	*Sets the current compute shader.  Mostly for compliance with platforms
-	*that require shader setting before resource binding.
-	*/
-	virtual void RHISetComputeShader(FRHIComputeShader* Shader) override final
+	virtual IRHIComputeContext& GetLowestLevelContext() override final
 	{
-		State.bComputeShaderSet = true;
+		checkSlow(RHIContext);
+		return *RHIContext;
+	}
+
+	virtual void SetExecutingCommandList(FRHICommandListBase* InCmdList) override final
+	{
+		IRHIComputeContext::SetExecutingCommandList(InCmdList);
+		RHIContext->SetExecutingCommandList(InCmdList);
+	}
+
+	virtual void RHISetComputePipelineState(FRHIComputePipelineState* ComputePipelineState) override final
+	{
+		State.BoundShader = ComputePipelineState->GetComputeShader();
 
 		// Reset the compute UAV tracker since the renderer must re-bind all resources after changing a shader.
 		Tracker->ResetUAVState(RHIValidation::EUAVMode::Compute);
 
-		RHIContext->RHISetComputeShader(Shader);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = true;
+		RHIContext->RHISetComputePipelineState(ComputePipelineState);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = false;
 	}
 
 	virtual void RHIDispatchComputeShader(uint32 ThreadGroupCountX, uint32 ThreadGroupCountY, uint32 ThreadGroupCountZ) override final
 	{
+		ValidateDispatch();
+		FValidationRHI::ValidateThreadGroupCount(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 		RHIContext->RHIDispatchComputeShader(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 		Tracker->Dispatch();
 	}
 
-	virtual void RHIDispatchIndirectComputeShader(FRHIVertexBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
+	virtual void RHIDispatchIndirectComputeShader(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
 	{
+		ValidateDispatch();
+		FValidationRHI::ValidateDispatchIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset);
 		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
-
 		RHIContext->RHIDispatchIndirectComputeShader(ArgumentBuffer, ArgumentOffset);
 		Tracker->Dispatch();
 	}
@@ -58,7 +85,17 @@ public:
 	{
 		for (const FRHITransition* Transition : Transitions)
 		{
+			Tracker->AddOps(Transition->PendingAliases);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
 			Tracker->AddOps(Transition->PendingOperationsBegin);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
+			Tracker->AddOps(Transition->PendingSignals[GetPipeline()]);
 		}
 
 		RHIContext->RHIBeginTransitions(Transitions);
@@ -68,124 +105,279 @@ public:
 	{
 		for (const FRHITransition* Transition : Transitions)
 		{
+			Tracker->AddOps(Transition->PendingWaits[GetPipeline()]);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
 			Tracker->AddOps(Transition->PendingOperationsEnd);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
+			Tracker->AddOps(Transition->PendingAliasingOverlaps);
 		}
 
 		RHIContext->RHIEndTransitions(Transitions);
 	}
 
-	virtual void RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4& Values) override final
+	virtual void SetTrackedAccess(const FRHITrackedAccessInfo& Info) override final
 	{
-		Tracker->Assert(UnorderedAccessViewRHI->ViewIdentity, ERHIAccess::UAVCompute);
+		check(Info.Resource != nullptr);
+		check(Info.Access != ERHIAccess::Unknown);
+
+		Tracker->SetTrackedAccess(Info.Resource->GetValidationTrackerResource(), Info.Access);
+
+		RHIContext->SetTrackedAccess(Info);
+	}
+
+	virtual void RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4f& Values) override final
+	{
+		Tracker->Assert(UnorderedAccessViewRHI->GetViewIdentity(), ERHIAccess::UAVCompute);
 		RHIContext->RHIClearUAVFloat(UnorderedAccessViewRHI, Values);
 	}
 
 	virtual void RHIClearUAVUint(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FUintVector4& Values) override final
 	{
-		Tracker->Assert(UnorderedAccessViewRHI->ViewIdentity, ERHIAccess::UAVCompute);
+		Tracker->Assert(UnorderedAccessViewRHI->GetViewIdentity(), ERHIAccess::UAVCompute);
 		RHIContext->RHIClearUAVUint(UnorderedAccessViewRHI, Values);
 	}
 
-	virtual void RHISubmitCommandsHint() override final
+	virtual void RHISetShaderRootConstants(const FUint32Vector4& Constants) final override
 	{
-		RHIValidation::FTracker::ReplayOpQueue(ERHIPipeline::AsyncCompute, Tracker->Finalize());
-		RHIContext->RHISubmitCommandsHint();
+		RHIContext->RHISetShaderRootConstants(Constants);
 	}
 
-	/** Set the shader resource view of a surface.  This is used for binding TextureMS parameter types that need a multi sampled view. */
-	virtual void RHISetShaderTexture(FRHIComputeShader* Shader, uint32 TextureIndex, FRHITexture* NewTexture) override final
+	virtual void RHIDispatchComputeShaderBundle(
+		FRHIShaderBundle* ShaderBundleRHI,
+		FRHIBuffer* RecordArgBuffer,
+		TConstArrayView<FRHIShaderParameterResource> SharedBindlessParameters,
+		TConstArrayView<FRHIShaderBundleComputeDispatch> Dispatches,
+		bool bEmulated) final override
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->Assert(NewTexture->GetWholeResourceIdentity(), ERHIAccess::SRVCompute);
-		RHIContext->RHISetShaderTexture(Shader, TextureIndex, NewTexture);
-	}
-
-	/**
-	* Sets sampler state.
-	* @param Shader				The compute shader to set the sampler for.
-	* @param SamplerIndex		The index of the sampler.
-	* @param NewState			The new sampler state.
-	*/
-	virtual void RHISetShaderSampler(FRHIComputeShader* Shader, uint32 SamplerIndex, FRHISamplerState* NewState) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderSampler(Shader, SamplerIndex, NewState);
-	}
-
-	/**
-	* Sets a compute shader UAV parameter.
-	* @param Shader	The compute shader to set the UAV for.
-	* @param UAVIndex		The index of the UAVIndex.
-	* @param UAV			The new UAV.
-	*/
-	virtual void RHISetUAVParameter(FRHIComputeShader* Shader, uint32 UAVIndex, FRHIUnorderedAccessView* UAV) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->AssertUAV(UAV, RHIValidation::EUAVMode::Compute, UAVIndex);
-		RHIContext->RHISetUAVParameter(Shader, UAVIndex, UAV);
-	}
-
-	/**
-	* Sets a compute shader counted UAV parameter and initial count
-	* @param Shader	The compute shader to set the UAV for.
-	* @param UAVIndex		The index of the UAVIndex.
-	* @param UAV			The new UAV.
-	* @param InitialCount	The initial number of items in the UAV.
-	*/
-	virtual void RHISetUAVParameter(FRHIComputeShader* Shader, uint32 UAVIndex, FRHIUnorderedAccessView* UAV, uint32 InitialCount) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->AssertUAV(UAV, RHIValidation::EUAVMode::Compute, UAVIndex);
-		RHIContext->RHISetUAVParameter(Shader, UAVIndex, UAV, InitialCount);
-	}
-
-	virtual void RHISetShaderResourceViewParameter(FRHIComputeShader* Shader, uint32 SamplerIndex, FRHIShaderResourceView* SRV) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		if (SRV) 
+		if (!GRHIGlobals.ShaderBundles.RequiresSharedBindlessParameters)
 		{
-			Tracker->Assert(SRV->ViewIdentity, ERHIAccess::SRVCompute);
+			RHI_VALIDATION_CHECK(SharedBindlessParameters.Num() == 0, TEXT("SharedBindlessParameters should not be set on this platform and configuration"));
 		}
-		RHIContext->RHISetShaderResourceViewParameter(Shader, SamplerIndex, SRV);
+
+		RHI_VALIDATION_CHECK(Dispatches.Num() > 0, TEXT("A shader bundle must be dispatched with at least one record."));
+		for (const FRHIShaderBundleComputeDispatch& Dispatch : Dispatches)
+		{
+			if (!Dispatch.IsValid())
+			{
+				continue;
+			}
+
+			State.BoundShader = Dispatch.Shader;
+
+			// Reset the compute UAV tracker since the renderer must re-bind all resources after changing a shader.
+			Tracker->ResetUAVState(RHIValidation::EUAVMode::Compute);
+
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, State.BoundUniformBuffers, Dispatch.Parameters->ResourceParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, State.BoundUniformBuffers, Dispatch.Parameters->BindlessParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+
+			if (bEmulated)
+			{
+				const uint32 ArgumentOffset = (Dispatch.RecordIndex * ShaderBundleRHI->ArgStride) + ShaderBundleRHI->ArgOffset;
+				FValidationRHI::ValidateDispatchIndirectArgsBuffer(RecordArgBuffer, ArgumentOffset);
+			}
+		}
+
+		Tracker->Assert(RecordArgBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+
+		RHIContext->RHIDispatchComputeShaderBundle(ShaderBundleRHI, RecordArgBuffer, SharedBindlessParameters, Dispatches, bEmulated);
+	}
+	
+	virtual void RHIDispatchGraphicsShaderBundle(
+		FRHIShaderBundle* ShaderBundleRHI,
+		FRHIBuffer* RecordArgBuffer,
+		const FRHIShaderBundleGraphicsState& BundleState,
+		TConstArrayView<FRHIShaderParameterResource> SharedBindlessParameters,
+		TConstArrayView<FRHIShaderBundleGraphicsDispatch> Dispatches,
+		bool bEmulated) final override
+	{
+		if (!GRHIGlobals.ShaderBundles.RequiresSharedBindlessParameters)
+		{
+			RHI_VALIDATION_CHECK(SharedBindlessParameters.Num() == 0, TEXT("SharedBindlessParameters should not be set on this platform and configuration"));
+		}
+
+		// TODO:
+#if 0
+		RHI_VALIDATION_CHECK(Dispatches.Num() > 0, TEXT("A shader bundle must be dispatched with at least one record."));
+		for (const FRHIShaderBundleGraphicsDispatch& Dispatch : Dispatches)
+		{
+			if (!Dispatch.IsValid())
+			{
+				continue;
+			}
+
+			// Reset the graphics UAV tracker since the renderer must re-bind all resources after changing a shader.
+			Tracker->ResetUAVState(RHIValidation::EUAVMode::Graphics);
+
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, Dispatch.Parameters.ResourceParameters, ERHIAccess::SRVGraphics, RHIValidation::EUAVMode::Graphics);
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, Dispatch.Parameters.BindlessParameters, ERHIAccess::SRVGraphics, RHIValidation::EUAVMode::Graphics);
+
+			if (bEmulated)
+			{
+				const uint32 ArgumentOffset = (Dispatch.RecordIndex * ShaderBundleRHI->ArgStride) + ShaderBundleRHI->ArgOffset;
+				//ValidateIndirectArgsBuffer
+				//FValidationRHI::ValidateDispatchIndirectArgsBuffer(RecordArgBuffer, ArgumentOffset);
+			}
+		}
+
+		Tracker->Assert(RecordArgBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+#endif
+		RHIContext->RHIDispatchGraphicsShaderBundle(ShaderBundleRHI, RecordArgBuffer, BundleState, SharedBindlessParameters, Dispatches, bEmulated);
 	}
 
-	virtual void RHISetShaderUniformBuffer(FRHIComputeShader* Shader, uint32 BufferIndex, FRHIUniformBuffer* Buffer) override final
+	virtual void RHIBeginUAVOverlap() final override
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Buffer->ValidateLifeTime();
-		RHIContext->RHISetShaderUniformBuffer(Shader, BufferIndex, Buffer);
+		Tracker->AllUAVsOverlap(true);
+		RHIContext->RHIBeginUAVOverlap();
 	}
 
-	virtual void RHISetShaderParameter(FRHIComputeShader* Shader, uint32 BufferIndex, uint32 BaseIndex, uint32 NumBytes, const void* NewValue) override final
+	virtual void RHIEndUAVOverlap() final override
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderParameter(Shader, BufferIndex, BaseIndex, NumBytes, NewValue);
+		Tracker->AllUAVsOverlap(false);
+		RHIContext->RHIEndUAVOverlap();
 	}
 
-	virtual void RHISetGlobalUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers) override final
+	virtual void RHIBeginUAVOverlap(TConstArrayView<FRHIUnorderedAccessView*> UAVs) final override
 	{
-		RHIContext->RHISetGlobalUniformBuffers(InUniformBuffers);
+		for (FRHIUnorderedAccessView* UAV : UAVs)
+		{
+			Tracker->SpecificUAVOverlap(UAV->GetViewIdentity(), true);
+		}
+		RHIContext->RHIBeginUAVOverlap(UAVs);
 	}
 
-	virtual void RHIPushEvent(const TCHAR* Name, FColor Color) override final
+	virtual void RHIEndUAVOverlap(TConstArrayView<FRHIUnorderedAccessView*> UAVs) final override
 	{
-		RHIContext->RHIPushEvent(Name, Color);
+		for (FRHIUnorderedAccessView* UAV : UAVs)
+		{
+			Tracker->SpecificUAVOverlap(UAV->GetViewIdentity(), false);
+		}
+		RHIContext->RHIEndUAVOverlap(UAVs);
 	}
 
-	virtual void RHIPopEvent() override final
+	virtual void RHISetShaderParameters(FRHIComputeShader* Shader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters) final override
 	{
-		RHIContext->RHIPopEvent();
+		if (State.BoundShader == nullptr)
+		{
+			RHI_VALIDATION_CHECK(false, TEXT("A compute PSO has to be set to set resources into a shader!"));
+			return;
+		}
+
+		if (Shader != State.BoundShader)
+		{
+			RHI_VALIDATION_CHECK(false, *FString::Printf(TEXT("Invalid attempt to set parameters for compute shader '%s' while the currently bound shader is '%s'"), Shader->GetShaderName(), State.BoundShader->GetShaderName()));
+			return;
+		}
+
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, State.BoundUniformBuffers, InResourceParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, State.BoundUniformBuffers, InBindlessParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+
+		RHIContext->RHISetShaderParameters(Shader, InParametersData, InParameters, InResourceParameters, InBindlessParameters);
 	}
+
+	virtual void RHISetShaderUnbinds(FRHIComputeShader* Shader, TConstArrayView<FRHIShaderParameterUnbind> InUnbinds) final override
+	{
+		if (State.BoundShader == nullptr)
+		{
+			RHI_VALIDATION_CHECK(false, TEXT("A compute PSO has to be set to set resources into a shader!"));
+			return;
+		}
+
+		RHIContext->RHISetShaderUnbinds(Shader, InUnbinds);
+	}
+
+	virtual void RHISetStaticUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers) override final
+	{
+		InUniformBuffers.Bind(State.StaticUniformBuffers.Bindings);
+		RHIContext->RHISetStaticUniformBuffers(InUniformBuffers);
+	}
+
+#if WITH_RHI_BREADCRUMBS
+	virtual void RHIBeginBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) final override
+	{
+		Tracker->BeginBreadcrumbGPU(Breadcrumb);
+		RHIContext->RHIBeginBreadcrumbGPU(Breadcrumb);
+	}
+	virtual void RHIEndBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) final override
+	{
+		Tracker->EndBreadcrumbGPU(Breadcrumb);
+		RHIContext->RHIEndBreadcrumbGPU(Breadcrumb);
+	}
+#endif // WITH_RHI_BREADCRUMBS
 
 	virtual void RHIWriteGPUFence(FRHIGPUFence* FenceRHI) override final
 	{
 		RHIContext->RHIWriteGPUFence(FenceRHI);
 	}
 
-	virtual void RHICopyToStagingBuffer(FRHIVertexBuffer* SourceBufferRHI, FRHIStagingBuffer* DestinationStagingBufferRHI, uint32 InOffset, uint32 InNumBytes) override final
+	virtual void RHISetGPUMask(FRHIGPUMask GPUMask) override final
 	{
-		Tracker->Assert(SourceBufferRHI->GetWholeResourceIdentity(), ERHIAccess::CopySrc); // @todo: is CopySrc correct?
-		RHIContext->RHICopyToStagingBuffer(SourceBufferRHI, DestinationStagingBufferRHI, InOffset, InNumBytes);
+		RHIContext->RHISetGPUMask(GPUMask);
+	}
+
+	virtual FRHIGPUMask RHIGetGPUMask() const override final
+	{
+		return RHIContext->RHIGetGPUMask();
+	}
+
+	virtual void RHICopyToStagingBuffer(FRHIBuffer* SourceBufferRHI, FRHIStagingBuffer* DestinationStagingBufferRHI, uint32 InOffset, uint32 InNumBytes) override final;
+
+#if WITH_MGPU
+	virtual void RHITransferResources(TConstArrayView<FTransferResourceParams> Params)
+	{
+		RHIContext->RHITransferResources(Params);
+	}
+
+	virtual void RHITransferResourceSignal(TConstArrayView<FTransferResourceFenceData*> FenceDatas, FRHIGPUMask SrcGPUMask)
+	{
+		RHIContext->RHITransferResourceSignal(FenceDatas, SrcGPUMask);
+	}
+
+	virtual void RHITransferResourceWait(TConstArrayView<FTransferResourceFenceData*> FenceDatas)
+	{
+		RHIContext->RHITransferResourceWait(FenceDatas);
+	}
+
+	virtual void RHICrossGPUTransfer(TConstArrayView<FTransferResourceParams> Params, TConstArrayView<FCrossGPUTransferFence*> PreTransfer, TConstArrayView<FCrossGPUTransferFence*> PostTransfer)
+	{
+		RHIContext->RHICrossGPUTransfer(Params, PreTransfer, PostTransfer);
+	}
+
+	virtual void RHICrossGPUTransferSignal(TConstArrayView<FTransferResourceParams> Params, TConstArrayView<FCrossGPUTransferFence*> PreTransfer)
+	{
+		RHIContext->RHICrossGPUTransferSignal(Params, PreTransfer);
+	}
+
+	virtual void RHICrossGPUTransferWait(TConstArrayView<FCrossGPUTransferFence*> SyncPoints)
+	{
+		RHIContext->RHICrossGPUTransferWait(SyncPoints);
+	}
+#endif // WITH_MGPU
+
+	virtual void RHIBuildAccelerationStructures(TConstArrayView<FRayTracingGeometryBuildParams> Params, const FRHIBufferRange& ScratchBufferRange) override final
+	{
+		// #yuriy_todo: explicit transitions and state validation for BLAS
+		RHIContext->RHIBuildAccelerationStructures(Params, ScratchBufferRange);
+	}
+
+	virtual void RHIBuildAccelerationStructure(const FRayTracingSceneBuildParams& SceneBuildParams) override final
+	{
+		// #yuriy_todo: validate all referenced BLAS states
+		if (SceneBuildParams.Scene)
+		{
+			Tracker->Assert(SceneBuildParams.Scene->GetWholeResourceIdentity(), ERHIAccess::BVHWrite);
+		}
+		RHIContext->RHIBuildAccelerationStructure(SceneBuildParams);
+	}
+
+	virtual void RHIBindAccelerationStructureMemory(FRHIRayTracingScene* Scene, FRHIBuffer* Buffer, uint32 BufferOffset) override final
+	{
+		RHIContext->RHIBindAccelerationStructureMemory(Scene, Buffer, BufferOffset);
 	}
 
 	inline void LinkToContext(IRHIComputeContext* PlatformContext)
@@ -195,63 +387,75 @@ public:
 		PlatformContext->Tracker = &State.TrackerInstance;
 	}
 
-	IRHIComputeContext* RHIContext;
+	IRHIComputeContext* RHIContext = nullptr;
 
 protected:
 	struct FState
 	{
-		RHIValidation::FTracker TrackerInstance;
+		RHIValidation::FTracker TrackerInstance{ ERHIPipeline::AsyncCompute };
+		RHIValidation::FStaticUniformBuffers StaticUniformBuffers;
+		RHIValidation::FStageBoundUniformBuffers BoundUniformBuffers;
 
 		FString ComputePassName;
-		bool bComputeShaderSet;
-
-		FState()
-			: TrackerInstance(ERHIPipeline::AsyncCompute)
-		{}
+		FRHIComputeShader* BoundShader = nullptr;
 
 		void Reset();
-	};
-	FState State;
+	} State;
 
 	friend class FValidationRHI;
 };
 
-class FValidationContext : public IRHICommandContext
+class FValidationContext final : public IRHICommandContext
 {
 public:
-	FValidationContext();
+	enum EType
+	{
+		Default,
+		Parallel
+	} const Type;
 
-	virtual IRHICommandContext& GetLowestLevelContext() override final
+	FValidationContext(EType InType);
+
+	virtual IRHIComputeContext& GetLowestLevelContext() override final
 	{
 		checkSlow(RHIContext);
 		return *RHIContext;
 	}
 
-	/**
-	*Sets the current compute shader.  Mostly for compliance with platforms
-	*that require shader setting before resource binding.
-	*/
-	virtual void RHISetComputeShader(FRHIComputeShader* Shader) override final
+	virtual void SetExecutingCommandList(FRHICommandListBase* InCmdList) override final
 	{
-		State.bComputeShaderSet = true;
+		IRHICommandContext::SetExecutingCommandList(InCmdList);
+		RHIContext->SetExecutingCommandList(InCmdList);
+	}
+
+	virtual void RHISetComputePipelineState(FRHIComputePipelineState* ComputePipelineState) override final
+	{
 		State.bGfxPSOSet = false;
+
+		FMemory::Memset(State.BoundShaders, 0);
+		State.BoundShaders[SF_Compute] = ComputePipelineState->GetComputeShader();
 
 		// Reset the compute UAV tracker since the renderer must re-bind all resources after changing a shader.
 		Tracker->ResetUAVState(RHIValidation::EUAVMode::Compute);
 
-		RHIContext->RHISetComputeShader(Shader);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = true;
+		RHIContext->RHISetComputePipelineState(ComputePipelineState);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = false;
 	}
 
 	virtual void RHIDispatchComputeShader(uint32 ThreadGroupCountX, uint32 ThreadGroupCountY, uint32 ThreadGroupCountZ) override final
 	{
+		ValidateDispatch();
+		FValidationRHI::ValidateThreadGroupCount(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 		RHIContext->RHIDispatchComputeShader(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
 		Tracker->Dispatch();
 	}
 
-	virtual void RHIDispatchIndirectComputeShader(FRHIVertexBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
+	virtual void RHIDispatchIndirectComputeShader(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
 	{
+		ValidateDispatch();
+		FValidationRHI::ValidateDispatchIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset);
 		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
-
 		RHIContext->RHIDispatchIndirectComputeShader(ArgumentBuffer, ArgumentOffset);
 		Tracker->Dispatch();
 	}
@@ -269,7 +473,7 @@ public:
 		RHIContext->RHISetMultipleViewports(Count, Data);
 	}
 
-	virtual void RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4& Values) final override
+	virtual void RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4f& Values) final override
 	{
 		// @todo should we assert here? If the base RHI uses a compute shader via
 		// FRHICommandList_RecursiveHazardous then we might double-assert which breaks the tracking
@@ -281,6 +485,96 @@ public:
 		// @todo should we assert here? If the base RHI uses a compute shader via
 		// FRHICommandList_RecursiveHazardous then we might double-assert which breaks the tracking
 		RHIContext->RHIClearUAVUint(UnorderedAccessViewRHI, Values);
+	}
+
+	virtual void RHISetShaderRootConstants(const FUint32Vector4& Constants) final override
+	{
+		RHIContext->RHISetShaderRootConstants(Constants);
+	}
+
+	virtual void RHIDispatchComputeShaderBundle(
+		FRHIShaderBundle* ShaderBundleRHI,
+		FRHIBuffer* RecordArgBuffer,
+		TConstArrayView<FRHIShaderParameterResource> SharedBindlessParameters,
+		TConstArrayView<FRHIShaderBundleComputeDispatch> Dispatches,
+		bool bEmulated) final override
+	{
+		if (!GRHIGlobals.ShaderBundles.RequiresSharedBindlessParameters)
+		{
+			RHI_VALIDATION_CHECK(SharedBindlessParameters.Num() == 0, TEXT("SharedBindlessParameters should not be set on this platform and configuration"));
+		}
+
+		RHI_VALIDATION_CHECK(Dispatches.Num() > 0, TEXT("A shader bundle must be dispatched with at least one record."));
+		RHIValidation::FStageBoundUniformBuffers& BoundUniformBuffers = State.BoundUniformBuffers.Get(SF_Compute);
+
+		for (const FRHIShaderBundleComputeDispatch& Dispatch : Dispatches)
+		{
+			if (!Dispatch.IsValid())
+			{
+				continue;
+			}
+
+			State.BoundShaders[SF_Compute] = Dispatch.Shader;
+			
+			// Reset the compute UAV tracker since the renderer must re-bind all resources after changing a shader.
+			Tracker->ResetUAVState(RHIValidation::EUAVMode::Compute);
+
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, Dispatch.Parameters->ResourceParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, Dispatch.Parameters->BindlessParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+
+			if (bEmulated)
+			{
+				const uint32 ArgumentOffset = (Dispatch.RecordIndex * ShaderBundleRHI->ArgStride) + ShaderBundleRHI->ArgOffset;
+				FValidationRHI::ValidateDispatchIndirectArgsBuffer(RecordArgBuffer, ArgumentOffset);
+			}
+		}
+
+		Tracker->Assert(RecordArgBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+
+		RHIContext->RHIDispatchComputeShaderBundle(ShaderBundleRHI, RecordArgBuffer, SharedBindlessParameters, Dispatches, bEmulated);
+	}
+
+	virtual void RHIDispatchGraphicsShaderBundle(
+		FRHIShaderBundle* ShaderBundleRHI,
+		FRHIBuffer* RecordArgBuffer,
+		const FRHIShaderBundleGraphicsState& BundleState,
+		TConstArrayView<FRHIShaderParameterResource> SharedBindlessParameters,
+		TConstArrayView<FRHIShaderBundleGraphicsDispatch> Dispatches,
+		bool bEmulated) final override
+	{
+		if (!GRHIGlobals.ShaderBundles.RequiresSharedBindlessParameters)
+		{
+			RHI_VALIDATION_CHECK(SharedBindlessParameters.Num() == 0, TEXT("SharedBindlessParameters should not be set on this platform and configuration"));
+		}
+
+		// TODO
+#if 0
+		RHI_VALIDATION_CHECK(Dispatches.Num() > 0, TEXT("A shader bundle must be dispatched with at least one record."));
+		for (const FRHIShaderBundleGraphicsDispatch& Dispatch : Dispatches)
+		{
+			if (!Dispatch.IsValid())
+			{
+				continue;
+			}
+
+			//State.bComputePSOSet = true;
+
+			// Reset the compute UAV tracker since the renderer must re-bind all resources after changing a shader.
+			Tracker->ResetUAVState(RHIValidation::EUAVMode::Graphics);
+
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, Dispatch.Parameters.ResourceParameters, ERHIAccess::SRVGraphics, RHIValidation::EUAVMode::Graphics);
+			ValidateShaderParameters(Dispatch.Shader, Tracker, State.StaticUniformBuffers, Dispatch.Parameters.BindlessParameters, ERHIAccess::SRVGraphics, RHIValidation::EUAVMode::Graphics);
+
+			if (bEmulated)
+			{
+				const uint32 ArgumentOffset = (Dispatch.RecordIndex * ShaderBundleRHI->ArgStride) + ShaderBundleRHI->ArgOffset;
+				//FValidationRHI::ValidateDispatchIndirectArgsBuffer(RecordArgBuffer, ArgumentOffset);
+			}
+		}
+
+		Tracker->Assert(RecordArgBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+#endif
+		RHIContext->RHIDispatchGraphicsShaderBundle(ShaderBundleRHI, RecordArgBuffer, BundleState, SharedBindlessParameters, Dispatches, bEmulated);
 	}
 
 	virtual void RHIBeginUAVOverlap() final override
@@ -295,55 +589,33 @@ public:
 		RHIContext->RHIEndUAVOverlap();
 	}
 
-	virtual void RHIBeginUAVOverlap(TArrayView<FRHIUnorderedAccessView* const> UAVs) final override
+	virtual void RHIBeginUAVOverlap(TConstArrayView<FRHIUnorderedAccessView*> UAVs) final override
 	{
 		for (FRHIUnorderedAccessView* UAV : UAVs)
 		{
-			Tracker->SpecificUAVOverlap(UAV->ViewIdentity, true);
+			Tracker->SpecificUAVOverlap(UAV->GetViewIdentity(), true);
 		}
 		RHIContext->RHIBeginUAVOverlap(UAVs);
 	}
 
-	virtual void RHIEndUAVOverlap(TArrayView<FRHIUnorderedAccessView* const> UAVs) final override
+	virtual void RHIEndUAVOverlap(TConstArrayView<FRHIUnorderedAccessView*> UAVs) final override
 	{
 		for (FRHIUnorderedAccessView* UAV : UAVs)
 		{
-			Tracker->SpecificUAVOverlap(UAV->ViewIdentity, false);
+			Tracker->SpecificUAVOverlap(UAV->GetViewIdentity(), false);
 		}
 		RHIContext->RHIEndUAVOverlap(UAVs);
 	}
 
-	/**
-	* Resolves from one texture to another.
-	* @param SourceTexture - texture to resolve from, 0 is silenty ignored
-	* @param DestTexture - texture to resolve to, 0 is silenty ignored
-	* @param ResolveParams - optional resolve params
-	*/
-	virtual void RHICopyToResolveTarget(FRHITexture* SourceTexture, FRHITexture* DestTexture, const FResolveParams& ResolveParams) override final
+	virtual void RHIResummarizeHTile(FRHITexture* DepthTexture) override final
 	{
-		RHIContext->RHICopyToResolveTarget(SourceTexture, DestTexture, ResolveParams);
+		Tracker->Assert(DepthTexture->GetWholeResourceIdentity(), ERHIAccess::DSVWrite);
+		RHIContext->RHIResummarizeHTile(DepthTexture);
+	}
 
-		auto SetAccess = [&](FRHITexture* Texture, ERHIAccess Access)
-		{
-			// If this is a depth texture, only transition the depth plane.
-			RHIValidation::FResourceIdentity Identity = (Texture->GetFlags() & (TexCreate_DepthStencilTargetable | TexCreate_DepthStencilResolveTarget))
-				? Texture->GetViewIdentity(0, 0, 0, 0, uint32(RHIValidation::EResourcePlane::Common), 1)
-				: Texture->GetWholeResourceIdentity();
-
-			Tracker->TransitionResource(Identity,
-				RHIValidation::FState(ERHIAccess::Unknown, ERHIPipeline::Graphics),
-				RHIValidation::FState(Access, ERHIPipeline::Graphics),
-				EResourceTransitionFlags::None);
-		};
-
-		if (SourceTexture && ResolveParams.SourceAccessFinal != ERHIAccess::Unknown)
-		{
-			SetAccess(SourceTexture, ResolveParams.SourceAccessFinal);
-		}
-		if (DestTexture && SourceTexture != DestTexture && ResolveParams.DestAccessFinal != ERHIAccess::Unknown)
-		{
-			SetAccess(DestTexture, ResolveParams.DestAccessFinal);
-		}
+	virtual void* RHIGetNativeCommandBuffer() override final
+	{
+		return RHIContext->RHIGetNativeCommandBuffer();
 	}
 
 	virtual void RHIBeginTransitions(TArrayView<const FRHITransition*> Transitions) override final
@@ -352,7 +624,17 @@ public:
 
 		for (const FRHITransition* Transition : Transitions)
 		{
+			Tracker->AddOps(Transition->PendingAliases);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
 			Tracker->AddOps(Transition->PendingOperationsBegin);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
+			Tracker->AddOps(Transition->PendingSignals[GetPipeline()]);
 		}
 
 		RHIContext->RHIBeginTransitions(Transitions);
@@ -364,10 +646,30 @@ public:
 
 		for (const FRHITransition* Transition : Transitions)
 		{
+			Tracker->AddOps(Transition->PendingWaits[GetPipeline()]);
+		}
+
+		for (const FRHITransition* Transition : Transitions)
+		{
 			Tracker->AddOps(Transition->PendingOperationsEnd);
 		}
 
+		for (const FRHITransition* Transition : Transitions)
+		{
+			Tracker->AddOps(Transition->PendingAliasingOverlaps);
+		}
+
 		RHIContext->RHIEndTransitions(Transitions);
+	}
+
+	virtual void SetTrackedAccess(const FRHITrackedAccessInfo& Info) override final
+	{
+		check(Info.Resource != nullptr);
+		check(Info.Access != ERHIAccess::Unknown);
+
+		Tracker->SetTrackedAccess(Info.Resource->GetValidationTrackerResource(), Info.Access);
+
+		RHIContext->SetTrackedAccess(Info);
 	}
 
 	virtual void RHIBeginRenderQuery(FRHIRenderQuery* RenderQuery) override final
@@ -383,19 +685,6 @@ public:
 	virtual void RHICalibrateTimers(FRHITimestampCalibrationQuery* CalibrationQuery) override final
 	{
 		RHIContext->RHICalibrateTimers(CalibrationQuery);
-	}
-
-	virtual void RHISubmitCommandsHint() override final
-	{
-		ensureMsgf(!State.bInsideBeginRenderPass, TEXT("Submitting inside a RenderPass is not efficient!"));
-		RHIContext->RHISubmitCommandsHint();
-		RHIValidation::FTracker::ReplayOpQueue(ERHIPipeline::Graphics, Tracker->Finalize());
-	}
-
-	// Used for OpenGL to check and see if any occlusion queries can be read back on the RHI thread. If they aren't ready when we need them, then we end up stalling.
-	virtual void RHIPollOcclusionQueries() override final
-	{
-		RHIContext->RHIPollOcclusionQueries();
 	}
 
 	// Not all RHIs need this (Mobile specific)
@@ -416,60 +705,7 @@ public:
 		RHIContext->RHIEndDrawingViewport(Viewport, bPresent, bLockToVsync);
 	}
 
-	// This method is queued with an RHIThread, otherwise it will flush after it is queued; without an RHI thread there is no benefit to queuing this frame advance commands
-	virtual void RHIBeginFrame() override final
-	{
-		State.Reset();
-		RHIContext->RHIBeginFrame();
-	}
-
-	// This method is queued with an RHIThread, otherwise it will flush after it is queued; without an RHI thread there is no benefit to queuing this frame advance commands
-	virtual void RHIEndFrame() override final;
-
-	/**
-	* Signals the beginning of scene rendering. The RHI makes certain caching assumptions between
-	* calls to BeginScene/EndScene. Currently the only restriction is that you can't update texture
-	* references.
-	*/
-	// This method is queued with an RHIThread, otherwise it will flush after it is queued; without an RHI thread there is no benefit to queuing this frame advance commands
-	virtual void RHIBeginScene() override final
-	{
-		RHIContext->RHIBeginScene();
-	}
-
-	/**
-	* Signals the end of scene rendering. See RHIBeginScene.
-	*/
-	// This method is queued with an RHIThread, otherwise it will flush after it is queued; without an RHI thread there is no benefit to queuing this frame advance commands
-	virtual void RHIEndScene() override final
-	{
-		RHIContext->RHIEndScene();
-	}
-
-	/**
-	* Signals the beginning and ending of rendering to a resource to be used in the next frame on a multiGPU system
-	*/
-	virtual void RHIBeginUpdateMultiFrameResource(FRHITexture* Texture) override final
-	{
-		RHIContext->RHIBeginUpdateMultiFrameResource(Texture);
-	}
-
-	virtual void RHIEndUpdateMultiFrameResource(FRHITexture* Texture) override final
-	{
-		RHIContext->RHIEndUpdateMultiFrameResource(Texture);
-	}
-
-	virtual void RHIBeginUpdateMultiFrameResource(FRHIUnorderedAccessView* UAV) override final
-	{
-		RHIContext->RHIBeginUpdateMultiFrameResource(UAV);
-	}
-
-	virtual void RHIEndUpdateMultiFrameResource(FRHIUnorderedAccessView* UAV) override final
-	{
-		RHIContext->RHIEndUpdateMultiFrameResource(UAV);
-	}
-
-	virtual void RHISetStreamSource(uint32 StreamIndex, FRHIVertexBuffer* VertexBuffer, uint32 Offset) override final
+	virtual void RHISetStreamSource(uint32 StreamIndex, FRHIBuffer* VertexBuffer, uint32 Offset) override final
 	{
 		//#todo-rco: Decide if this is needed or not...
 		//checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set-up the vertex streams!"));
@@ -507,166 +743,117 @@ public:
 		RHIContext->RHISetScissorRect(bEnable, MinX, MinY, MaxX, MaxY);
 	}
 
-	virtual void RHISetGraphicsPipelineState(FRHIGraphicsPipelineState* GraphicsState, bool bApplyAdditionalState) override final
+	virtual void RHISetGraphicsPipelineState(FRHIGraphicsPipelineState* GraphicsState, uint32 StencilRef, bool bApplyAdditionalState) override final
 	{
 		checkf(State.bInsideBeginRenderPass, TEXT("Graphics PSOs can only be set inside a RenderPass!"));
 		State.bGfxPSOSet = true;
-		State.bComputeShaderSet = false;
 
-		FRHIRenderPassInfo::FDepthStencilEntry& DSV = State.RenderPassInfo.DepthStencilRenderTarget;
-
-		// assert depth is in the correct mode
-		if (GraphicsState->DSMode.IsUsingDepth())
+		for (int32 FrequencyIndex = 0; FrequencyIndex < SF_NumFrequencies; ++FrequencyIndex)
 		{
-			checkf(DSV.ExclusiveDepthStencil.IsUsingDepth(), TEXT("Graphics PSO is using depth but it's not enabled on the RenderPass."));
-			checkf(GraphicsState->DSMode.IsDepthRead() || DSV.ExclusiveDepthStencil.IsDepthWrite(), TEXT("Graphics PSO is writing to depth but RenderPass depth is ReadOnly."));
+			EShaderFrequency Frequency = (EShaderFrequency)FrequencyIndex;
+			State.BoundShaders[FrequencyIndex] = IsValidGraphicsFrequency(Frequency) ? GraphicsState->GetShader(Frequency) : nullptr;
 		}
 
-		// assert stencil is in the correct mode
-		if (GraphicsState->DSMode.IsUsingStencil())
-		{
-			checkf(DSV.ExclusiveDepthStencil.IsUsingStencil(), TEXT("Graphics PSO is using stencil but it's not enabled on the RenderPass."));
-			checkf(GraphicsState->DSMode.IsStencilRead() || DSV.ExclusiveDepthStencil.IsStencilWrite(), TEXT("Graphics PSO is writing to stencil but RenderPass stencil is ReadOnly."));
-		}
+		ValidateDepthStencilForSetGraphicsPipelineState(GraphicsState->DSMode);
 
 		// Setting a new PSO unbinds all previous bound resources
 		Tracker->ResetUAVState(RHIValidation::EUAVMode::Graphics);
 
-		RHIContext->RHISetGraphicsPipelineState(GraphicsState, bApplyAdditionalState);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = true;
+		RHIContext->RHISetGraphicsPipelineState(GraphicsState, StencilRef, bApplyAdditionalState);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = false;
 	}
 
-	/** Set the shader resource view of a surface.  This is used for binding TextureMS parameter types that need a multi sampled view. */
-	virtual void RHISetShaderTexture(FRHIGraphicsShader* Shader, uint32 TextureIndex, FRHITexture* NewTexture) override final
+#if PLATFORM_USE_FALLBACK_PSO
+	virtual void RHISetGraphicsPipelineState(const FGraphicsPipelineStateInitializer& PsoInit, uint32 StencilRef, bool bApplyAdditionalState) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set resources into a shader!"));
-		Tracker->Assert(NewTexture->GetWholeResourceIdentitySRV(), ERHIAccess::SRVGraphics);
-		RHIContext->RHISetShaderTexture(Shader, TextureIndex, NewTexture);
+		checkf(State.bInsideBeginRenderPass, TEXT("Graphics PSOs can only be set inside a RenderPass!"));
+		State.bGfxPSOSet = true;
+
+		FMemory::Memset(State.BoundShaders, 0);
+		State.BoundShaders[SF_Vertex] = PsoInit.BoundShaderState.GetVertexShader();
+		State.BoundShaders[SF_Pixel] = PsoInit.BoundShaderState.GetPixelShader();
+		State.BoundShaders[SF_Geometry] = PsoInit.BoundShaderState.GetGeometryShader();
+		State.BoundShaders[SF_Amplification] = PsoInit.BoundShaderState.GetAmplificationShader();
+		State.BoundShaders[SF_Mesh] = PsoInit.BoundShaderState.GetMeshShader();
+
+		ValidateDepthStencilForSetGraphicsPipelineState(PsoInit.DepthStencilState->ActualDSMode);
+
+		// Setting a new PSO unbinds all previous bound resources
+		Tracker->ResetUAVState(RHIValidation::EUAVMode::Graphics);
+
+		State.StaticUniformBuffers.bInSetPipelineStateCall = true;
+		RHIContext->RHISetGraphicsPipelineState(PsoInit, StencilRef, bApplyAdditionalState);
+		State.StaticUniformBuffers.bInSetPipelineStateCall = false;
 	}
+#endif
 
-	/** Set the shader resource view of a surface.  This is used for binding TextureMS parameter types that need a multi sampled view. */
-	virtual void RHISetShaderTexture(FRHIComputeShader* Shader, uint32 TextureIndex, FRHITexture* NewTexture) override final
+	virtual void RHISetShaderParameters(FRHIGraphicsShader* Shader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters) final override
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->Assert(NewTexture->GetWholeResourceIdentitySRV(), ERHIAccess::SRVCompute);
-		RHIContext->RHISetShaderTexture(Shader, TextureIndex, NewTexture);
-	}
-
-	/**
-	* Sets sampler state.
-	* @param Shader				The compute shader to set the sampler for.
-	* @param SamplerIndex		The index of the sampler.
-	* @param NewState			The new sampler state.
-	*/
-	virtual void RHISetShaderSampler(FRHIComputeShader* Shader, uint32 SamplerIndex, FRHISamplerState* NewState) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderSampler(Shader, SamplerIndex, NewState);
-	}
-
-	/**
-	* Sets sampler state.
-	* @param Shader				The graphics shader to set the sampler for.
-	* @param SamplerIndex		The index of the sampler.
-	* @param NewState			The new sampler state.
-	*/
-	virtual void RHISetShaderSampler(FRHIGraphicsShader* Shader, uint32 SamplerIndex, FRHISamplerState* NewState) override final
-	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderSampler(Shader, SamplerIndex, NewState);
-	}
-
-	/**
-	* Sets a pixel shader UAV parameter.
-	* @param Shader	The pixel shader to set the UAV for.
-	* @param UAVIndex		The index of the UAVIndex.
-	* @param UAV			The new UAV.
-	*/
-	virtual void RHISetUAVParameter(FRHIPixelShader* Shader, uint32 UAVIndex, FRHIUnorderedAccessView* UAV) override final
-	{
-		checkf(State.bGfxPSOSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->AssertUAV(UAV, RHIValidation::EUAVMode::Graphics, UAVIndex);
-		RHIContext->RHISetUAVParameter(Shader, UAVIndex, UAV);
-	}
-
-
-
-
-	/**
-	* Sets a compute shader UAV parameter.
-	* @param Shader	The compute shader to set the UAV for.
-	* @param UAVIndex		The index of the UAVIndex.
-	* @param UAV			The new UAV.
-	*/
-	virtual void RHISetUAVParameter(FRHIComputeShader* Shader, uint32 UAVIndex, FRHIUnorderedAccessView* UAV) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->AssertUAV(UAV, RHIValidation::EUAVMode::Compute, UAVIndex);
-		RHIContext->RHISetUAVParameter(Shader, UAVIndex, UAV);
-	}
-
-	/**
-	* Sets a compute shader counted UAV parameter and initial count
-	* @param Shader	The compute shader to set the UAV for.
-	* @param UAVIndex		The index of the UAVIndex.
-	* @param UAV			The new UAV.
-	* @param InitialCount	The initial number of items in the UAV.
-	*/
-	virtual void RHISetUAVParameter(FRHIComputeShader* Shader, uint32 UAVIndex, FRHIUnorderedAccessView* UAV, uint32 InitialCount) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Tracker->AssertUAV(UAV, RHIValidation::EUAVMode::Compute, UAVIndex);
-		RHIContext->RHISetUAVParameter(Shader, UAVIndex, UAV, InitialCount);
-	}
-
-	virtual void RHISetShaderResourceViewParameter(FRHIGraphicsShader* Shader, uint32 SamplerIndex, FRHIShaderResourceView* SRV) override final
-	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set resources into a shader!"));
-		if (SRV)
+		if (!State.bGfxPSOSet)
 		{
-			Tracker->Assert(SRV->ViewIdentity, ERHIAccess::SRVGraphics);
+			RHI_VALIDATION_CHECK(false, TEXT("A graphics PSO has to be set to set resources into a shader!"));
+			return;
 		}
-		RHIContext->RHISetShaderResourceViewParameter(Shader, SamplerIndex, SRV);
+
+		RHIValidation::FStageBoundUniformBuffers& BoundUniformBuffers = State.BoundUniformBuffers.Get(Shader->GetFrequency());
+
+		ERHIAccess RequiredAccess = Shader->GetFrequency() == SF_Pixel ? ERHIAccess::SRVGraphicsPixel : ERHIAccess::SRVGraphicsNonPixel;
+
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, InResourceParameters, RequiredAccess, RHIValidation::EUAVMode::Graphics);
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, InBindlessParameters, RequiredAccess, RHIValidation::EUAVMode::Graphics);
+
+		RHIContext->RHISetShaderParameters(Shader, InParametersData, InParameters, InResourceParameters, InBindlessParameters);
 	}
 
-	virtual void RHISetShaderResourceViewParameter(FRHIComputeShader* Shader, uint32 SamplerIndex, FRHIShaderResourceView* SRV) override final
+	virtual void RHISetShaderParameters(FRHIComputeShader* Shader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters) final override
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		if (SRV)
+		if (State.BoundShaders[SF_Compute] == nullptr)
 		{
-			Tracker->Assert(SRV->ViewIdentity, ERHIAccess::SRVCompute);
+			RHI_VALIDATION_CHECK(false, TEXT("A compute PSO has to be set to set resources into a shader!"));
+			return;
 		}
-		RHIContext->RHISetShaderResourceViewParameter(Shader, SamplerIndex, SRV);
+
+		if (Shader != State.BoundShaders[SF_Compute])
+		{
+			RHI_VALIDATION_CHECK(false, *FString::Printf(TEXT("Invalid attempt to set parameters for compute shader '%s' while the currently bound shader is '%s'"), Shader->GetShaderName(), State.BoundShaders[SF_Compute]->GetShaderName()));
+			return;
+		}
+
+		RHIValidation::FStageBoundUniformBuffers& BoundUniformBuffers = State.BoundUniformBuffers.Get(SF_Compute);
+
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, InResourceParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+		ValidateShaderParameters(Shader, Tracker, State.StaticUniformBuffers, BoundUniformBuffers, InBindlessParameters, ERHIAccess::SRVCompute, RHIValidation::EUAVMode::Compute);
+
+		RHIContext->RHISetShaderParameters(Shader, InParametersData, InParameters, InResourceParameters, InBindlessParameters);
 	}
 
-	virtual void RHISetShaderUniformBuffer(FRHIGraphicsShader* Shader, uint32 BufferIndex, FRHIUniformBuffer* Buffer) override final
+	virtual void RHISetShaderUnbinds(FRHIGraphicsShader* Shader, TConstArrayView<FRHIShaderParameterUnbind> InUnbinds) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set resources into a shader!"));
-		Buffer->ValidateLifeTime();
-		RHIContext->RHISetShaderUniformBuffer(Shader, BufferIndex, Buffer);
+		if (!State.bGfxPSOSet)
+		{
+			RHI_VALIDATION_CHECK(false, TEXT("A graphics PSO has to be set to set resources into a shader!"));
+			return;
+		}
+
+		RHIContext->RHISetShaderUnbinds(Shader, InUnbinds);
 	}
 
-	virtual void RHISetShaderUniformBuffer(FRHIComputeShader* Shader, uint32 BufferIndex, FRHIUniformBuffer* Buffer) override final
+	virtual void RHISetShaderUnbinds(FRHIComputeShader* Shader, TConstArrayView<FRHIShaderParameterUnbind> InUnbinds) override final
 	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		Buffer->ValidateLifeTime();
-		RHIContext->RHISetShaderUniformBuffer(Shader, BufferIndex, Buffer);
+		if (State.BoundShaders[SF_Compute] == nullptr)
+		{
+			RHI_VALIDATION_CHECK(false, TEXT("A compute PSO has to be set to set resources into a shader!"));
+			return;
+		}
+
+		RHIContext->RHISetShaderUnbinds(Shader, InUnbinds);
 	}
 
-	virtual void RHISetShaderParameter(FRHIGraphicsShader* Shader, uint32 BufferIndex, uint32 BaseIndex, uint32 NumBytes, const void* NewValue) override final
+	virtual void RHISetStaticUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderParameter(Shader, BufferIndex, BaseIndex, NumBytes, NewValue);
-	}
-
-	virtual void RHISetShaderParameter(FRHIComputeShader* Shader, uint32 BufferIndex, uint32 BaseIndex, uint32 NumBytes, const void* NewValue) override final
-	{
-		checkf(State.bComputeShaderSet, TEXT("A Compute shader has to be set to set resources into a shader!"));
-		RHIContext->RHISetShaderParameter(Shader, BufferIndex, BaseIndex, NumBytes, NewValue);
-	}
-
-	virtual void RHISetGlobalUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers) override final
-	{
-		RHIContext->RHISetGlobalUniformBuffers(InUniformBuffers);
+		InUniformBuffers.Bind(State.StaticUniformBuffers.Bindings);
+		RHIContext->RHISetStaticUniformBuffers(InUniformBuffers);
 	}
 
 	virtual void RHISetStencilRef(uint32 StencilRef) override final
@@ -683,25 +870,24 @@ public:
 
 	virtual void RHIDrawPrimitive(uint32 BaseVertexIndex, uint32 NumPrimitives, uint32 NumInstances) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to draw!"));
-		SetupDrawing();
+		ValidateDrawing();
 		RHIContext->RHIDrawPrimitive(BaseVertexIndex, NumPrimitives, NumInstances);
 		Tracker->Draw();
 	}
 
-	virtual void RHIDrawPrimitiveIndirect(FRHIVertexBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
+	virtual void RHIDrawPrimitiveIndirect(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to draw!"));
-		SetupDrawing();
+		ValidateDrawing();
+		FValidationRHI::ValidateIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset, sizeof(FRHIDrawIndirectParameters), 0);
 		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
 		RHIContext->RHIDrawPrimitiveIndirect(ArgumentBuffer, ArgumentOffset);
 		Tracker->Draw();
 	}
 
-	virtual void RHIDrawIndexedIndirect(FRHIIndexBuffer* IndexBufferRHI, FRHIStructuredBuffer* ArgumentsBufferRHI, int32 DrawArgumentsIndex, uint32 NumInstances) override final
+	virtual void RHIDrawIndexedIndirect(FRHIBuffer* IndexBufferRHI, FRHIBuffer* ArgumentsBufferRHI, int32 DrawArgumentsIndex, uint32 NumInstances) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to draw!"));
-		SetupDrawing();
+		ValidateDrawing();
+		FValidationRHI::ValidateIndirectArgsBuffer(ArgumentsBufferRHI, DrawArgumentsIndex * ArgumentsBufferRHI->GetStride(), sizeof(FRHIDrawIndexedIndirectParameters), 0);
 		Tracker->Assert(ArgumentsBufferRHI->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
 		Tracker->Assert(IndexBufferRHI->GetWholeResourceIdentity(), ERHIAccess::VertexOrIndexBuffer);
 		RHIContext->RHIDrawIndexedIndirect(IndexBufferRHI, ArgumentsBufferRHI, DrawArgumentsIndex, NumInstances);
@@ -709,22 +895,55 @@ public:
 	}
 
 	// @param NumPrimitives need to be >0 
-	virtual void RHIDrawIndexedPrimitive(FRHIIndexBuffer* IndexBuffer, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances) override final
+	virtual void RHIDrawIndexedPrimitive(FRHIBuffer* IndexBuffer, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to draw!"));
-		SetupDrawing();
+		ValidateDrawing();
+		checkf(EnumHasAnyFlags(IndexBuffer->GetUsage(), EBufferUsageFlags::IndexBuffer), TEXT("The buffer '%s' is used as an index buffer, but was not created with the IndexBuffer flag."), *IndexBuffer->GetName().ToString());
 		Tracker->Assert(IndexBuffer->GetWholeResourceIdentity(), ERHIAccess::VertexOrIndexBuffer);
 		RHIContext->RHIDrawIndexedPrimitive(IndexBuffer, BaseVertexIndex, FirstInstance, NumVertices, StartIndex, NumPrimitives, NumInstances);
 		Tracker->Draw();
 	}
 
-	virtual void RHIDrawIndexedPrimitiveIndirect(FRHIIndexBuffer* IndexBuffer, FRHIVertexBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
+	virtual void RHIDrawIndexedPrimitiveIndirect(FRHIBuffer* IndexBuffer, FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
 	{
-		checkf(State.bGfxPSOSet, TEXT("A Graphics PSO has to be set to draw!"));
-		SetupDrawing();
+		ValidateDrawing();
+		checkf(EnumHasAnyFlags(IndexBuffer->GetUsage(), EBufferUsageFlags::IndexBuffer), TEXT("The buffer '%s' is used as an index buffer, but was not created with the IndexBuffer flag."), *IndexBuffer->GetName().ToString());
+		FValidationRHI::ValidateIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset, sizeof(FRHIDrawIndexedIndirectParameters), 0);
 		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
 		Tracker->Assert(IndexBuffer->GetWholeResourceIdentity(), ERHIAccess::VertexOrIndexBuffer);
 		RHIContext->RHIDrawIndexedPrimitiveIndirect(IndexBuffer, ArgumentBuffer, ArgumentOffset);
+		Tracker->Draw();
+	}
+
+	virtual void RHIMultiDrawIndexedPrimitiveIndirect(FRHIBuffer* IndexBuffer, FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset, FRHIBuffer* CountBuffer, uint32 CountBufferOffset, uint32 MaxDrawArguments) override final
+	{
+		ValidateDrawing();
+		checkf(EnumHasAnyFlags(IndexBuffer->GetUsage(), EBufferUsageFlags::IndexBuffer), TEXT("The buffer '%s' is used as an index buffer, but was not created with the IndexBuffer flag."), *IndexBuffer->GetName().ToString());
+		FValidationRHI::ValidateIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset, sizeof(FRHIDrawIndexedIndirectParameters), 0);
+		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+		if (CountBuffer)
+		{
+			Tracker->Assert(CountBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+		}
+		Tracker->Assert(IndexBuffer->GetWholeResourceIdentity(), ERHIAccess::VertexOrIndexBuffer);
+		RHIContext->RHIMultiDrawIndexedPrimitiveIndirect(IndexBuffer, ArgumentBuffer, ArgumentOffset, CountBuffer, CountBufferOffset, MaxDrawArguments);
+		Tracker->Draw();
+	}
+
+	virtual void RHIDispatchMeshShader(uint32 ThreadGroupCountX, uint32 ThreadGroupCountY, uint32 ThreadGroupCountZ) final override
+	{
+		ValidateDrawing();
+		FValidationRHI::ValidateThreadGroupCount(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+		RHIContext->RHIDispatchMeshShader(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+		Tracker->Draw();
+	}
+
+	virtual void RHIDispatchIndirectMeshShader(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) final override
+	{
+		ValidateDrawing();
+		FValidationRHI::ValidateDispatchIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset);
+		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+		RHIContext->RHIDispatchIndirectMeshShader(ArgumentBuffer, ArgumentOffset);
 		Tracker->Draw();
 	}
 
@@ -736,6 +955,8 @@ public:
 	*/
 	virtual void RHISetDepthBounds(float MinDepth, float MaxDepth) override final
 	{
+		checkf(MinDepth >= 0.f && MinDepth <= 1.f, TEXT("Depth bounds min of %f is outside allowed range of [0, 1]"), MinDepth);
+		checkf(MaxDepth >= 0.f && MaxDepth <= 1.f, TEXT("Depth bounds max of %f is outside allowed range of [0, 1]"), MaxDepth);
 		RHIContext->RHISetDepthBounds(MinDepth, MaxDepth);
 	}
 
@@ -744,41 +965,43 @@ public:
 		RHIContext->RHISetShadingRate(ShadingRate, Combiner);
 	}
 
-	virtual void RHISetShadingRateImage(FRHITexture* RateImageTexture, EVRSRateCombiner Combiner) override final
+#if WITH_RHI_BREADCRUMBS
+	virtual void RHIBeginBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) override final
 	{
-		RHIContext->RHISetShadingRateImage(RateImageTexture, Combiner);
+		Tracker->BeginBreadcrumbGPU(Breadcrumb);
+		RHIContext->RHIBeginBreadcrumbGPU(Breadcrumb);
 	}
-
-	virtual void RHIPushEvent(const TCHAR* Name, FColor Color) override final
+	virtual void RHIEndBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) override final
 	{
-		RHIContext->RHIPushEvent(Name, Color);
+		Tracker->EndBreadcrumbGPU(Breadcrumb);
+		RHIContext->RHIEndBreadcrumbGPU(Breadcrumb);
 	}
-
-	virtual void RHIPopEvent() override final
-	{
-		RHIContext->RHIPopEvent();
-	}
-
-	virtual void RHIUpdateTextureReference(FRHITextureReference* TextureRef, FRHITexture* NewTexture) override final
-	{
-		RHIContext->RHIUpdateTextureReference(TextureRef, NewTexture);
-	}
+#endif // WITH_RHI_BREADCRUMBS
 
 	virtual void RHIBeginRenderPass(const FRHIRenderPassInfo& InInfo, const TCHAR* InName) override final
 	{
 		checkf(!State.bInsideBeginRenderPass, TEXT("Trying to begin RenderPass '%s', but already inside '%s'!"), *State.RenderPassName, InName);
-		checkf(InName, TEXT("RenderPass should have a name!"));
+		checkf(InName!=nullptr, TEXT("RenderPass should have a name!"));
 		State.bInsideBeginRenderPass = true;
 		State.RenderPassInfo = InInfo;
 		State.RenderPassName = InName;
-		State.bGfxPSOSet = false;
+
+		FIntVector ViewDimensions = FIntVector(0);
 
 		// assert that render targets are writable
 		for (int32 RTVIndex = 0; RTVIndex < MaxSimultaneousRenderTargets; ++RTVIndex)
 		{
 			FRHIRenderPassInfo::FColorEntry& RTV = State.RenderPassInfo.ColorRenderTargets[RTVIndex];
 			if (RTV.RenderTarget == nullptr)
+			{
+				checkf(RTV.ResolveTarget == nullptr, TEXT("Render target is null, but resolve target is not."));
 				continue;
+			}
+
+			// Check all bound textures have the same dimensions
+			FIntVector MipDimensions = RTV.RenderTarget->GetMipDimensions(RTV.MipIndex);
+			checkf(ViewDimensions.IsZero() || ViewDimensions == MipDimensions, TEXT("Render target size mismatch (RT%d: %dx%d vs. Expected: %dx%d). All render and depth target views must have the same effective dimensions."), RTVIndex, MipDimensions.X, MipDimensions.Y, ViewDimensions.X, ViewDimensions.Y);
+			ViewDimensions = MipDimensions;
 
 			uint32 ArraySlice = RTV.ArraySlice;
 			uint32 NumArraySlices = 1;
@@ -789,9 +1012,39 @@ public:
 			}
 
 			Tracker->Assert(RTV.RenderTarget->GetViewIdentity(RTV.MipIndex, 1, ArraySlice, NumArraySlices, 0, 0), ERHIAccess::RTV);
+
+			if (RTV.ResolveTarget)
+			{
+				const FRHITextureDesc& RenderTargetDesc = RTV.RenderTarget->GetDesc();
+				const FRHITextureDesc& ResolveTargetDesc = RTV.ResolveTarget->GetDesc();
+
+				checkf(RenderTargetDesc.Extent == ResolveTargetDesc.Extent, TEXT("Render target extent must match resolve target extent."));
+				checkf(RenderTargetDesc.Format == ResolveTargetDesc.Format, TEXT("Render target format must match resolve target format."));
+
+				Tracker->Assert(RTV.ResolveTarget->GetViewIdentity(RTV.MipIndex, 1, ArraySlice, NumArraySlices, 0, 0), ERHIAccess::ResolveDst);
+			}
 		}
 
 		FRHIRenderPassInfo::FDepthStencilEntry& DSV = State.RenderPassInfo.DepthStencilRenderTarget;
+
+		if (DSV.DepthStencilTarget)
+		{
+			// Check all bound textures have the same dimensions
+			FIntVector MipDimensions = DSV.DepthStencilTarget->GetMipDimensions(0);
+			checkf(ViewDimensions.IsZero() || ViewDimensions == MipDimensions, TEXT("Depth target size mismatch (Depth: %dx%d vs. Expected: %dx%d). All render and depth target views must have the same effective dimensions."), MipDimensions.X, MipDimensions.Y, ViewDimensions.X, ViewDimensions.Y);
+			ViewDimensions = MipDimensions;
+
+			if (DSV.ResolveTarget)
+			{
+				const FRHITextureDesc& DepthStencilTargetDesc = DSV.DepthStencilTarget->GetDesc();
+				const FRHITextureDesc& ResolveTargetDesc = DSV.ResolveTarget->GetDesc();
+
+				checkf(DepthStencilTargetDesc.Extent == ResolveTargetDesc.Extent, TEXT("Depth stencil target extent must match resolve target extent."));
+				checkf(DepthStencilTargetDesc.IsTexture2D() && ResolveTargetDesc.IsTexture2D(), TEXT("Only 2D depth stencil resolves are supported."));
+			}
+		}
+
+		// @todo: additional checks for matching array slice counts on RTVs/DSVs
 
 		// assert depth is in the correct mode
 		if (DSV.ExclusiveDepthStencil.IsUsingDepth())
@@ -802,6 +1055,11 @@ public:
 
 			checkf(DSV.DepthStencilTarget, TEXT("Depth read/write is enabled but no depth stencil texture is bound."));
 			Tracker->Assert(DSV.DepthStencilTarget->GetViewIdentity(0, 0, 0, 0, uint32(RHIValidation::EResourcePlane::Common), 1), DepthAccess);
+
+			if (DSV.ResolveTarget)
+			{
+				Tracker->Assert(DSV.ResolveTarget->GetViewIdentity(0, 0, 0, 0, uint32(RHIValidation::EResourcePlane::Common), 1), ERHIAccess::ResolveDst);
+			}
 		}
 
 		// assert stencil is in the correct mode
@@ -816,7 +1074,22 @@ public:
 			bool bIsStencilFormat = IsStencilFormat(DSV.DepthStencilTarget->GetFormat());
 			checkf(bIsStencilFormat, TEXT("Stencil read/write is enabled but depth stencil texture doesn't have a stencil plane."));
 			if (bIsStencilFormat)
+			{
 				Tracker->Assert(DSV.DepthStencilTarget->GetViewIdentity(0, 0, 0, 0, uint32(RHIValidation::EResourcePlane::Stencil), 1), StencilAccess);
+
+				if (DSV.ResolveTarget)
+				{
+					Tracker->Assert(DSV.ResolveTarget->GetViewIdentity(0, 0, 0, 0, uint32(RHIValidation::EResourcePlane::Stencil), 1), ERHIAccess::ResolveDst);
+				}
+			}
+		}
+
+		// assert shading-rate attachment is in the correct mode and format.
+		if (State.RenderPassInfo.ShadingRateTexture.IsValid())
+		{
+			FTextureRHIRef ShadingRateTexture = State.RenderPassInfo.ShadingRateTexture;
+			checkf(ShadingRateTexture->GetFormat() == GRHIVariableRateShadingImageFormat, TEXT("Shading rate texture is bound, but is not the correct format for this RHI."));
+			Tracker->Assert(ShadingRateTexture->GetViewIdentity(0, 0, 0, 0, 0, 0), ERHIAccess::ShadingRateSource);
 		}
 
 		RHIContext->RHIBeginRenderPass(InInfo, InName);
@@ -828,7 +1101,6 @@ public:
 		RHIContext->RHIEndRenderPass();
 		State.bInsideBeginRenderPass = false;
 		State.PreviousRenderPassName = State.RenderPassName;
-		State.bGfxPSOSet = false;
 	}
 
 	virtual void RHIWriteGPUFence(FRHIGPUFence* FenceRHI) override final
@@ -836,11 +1108,17 @@ public:
 		RHIContext->RHIWriteGPUFence(FenceRHI);
 	}
 
-	virtual void RHICopyToStagingBuffer(FRHIVertexBuffer* SourceBufferRHI, FRHIStagingBuffer* DestinationStagingBufferRHI, uint32 InOffset, uint32 InNumBytes) override final
+	virtual void RHISetGPUMask(FRHIGPUMask GPUMask) override final
 	{
-		Tracker->Assert(SourceBufferRHI->GetWholeResourceIdentity(), ERHIAccess::CopySrc); // @todo: is CopySrc correct?
-		RHIContext->RHICopyToStagingBuffer(SourceBufferRHI, DestinationStagingBufferRHI, InOffset, InNumBytes);
+		RHIContext->RHISetGPUMask(GPUMask);
 	}
+
+	virtual FRHIGPUMask RHIGetGPUMask() const override final
+	{
+		return RHIContext->RHIGetGPUMask();
+	}
+
+	virtual void RHICopyToStagingBuffer(FRHIBuffer* SourceBufferRHI, FRHIStagingBuffer* DestinationStagingBufferRHI, uint32 InOffset, uint32 InNumBytes) override final;
 
 	virtual void RHICopyTexture(FRHITexture* SourceTexture, FRHITexture* DestTexture, const FRHICopyTextureInfo& CopyInfo) override final
 	{
@@ -851,107 +1129,90 @@ public:
 		Tracker->Assert(SourceTexture->GetWholeResourceIdentity(), ERHIAccess::CopySrc);
 		Tracker->Assert(DestTexture->GetWholeResourceIdentity(), ERHIAccess::CopyDest);
 
-		FValidationRHIUtils::ValidateCopyTexture(SourceTexture, DestTexture, CopyInfo.Size, CopyInfo.SourcePosition, CopyInfo.DestPosition);
+		FValidationRHIUtils::ValidateCopyTexture(SourceTexture, DestTexture, CopyInfo);
 		RHIContext->RHICopyTexture(SourceTexture, DestTexture, CopyInfo);
 	}
 
-#if RHI_RAYTRACING
-	virtual void RHICopyBufferRegion(FRHIVertexBuffer* DestBuffer, uint64 DstOffset, FRHIVertexBuffer* SourceBuffer, uint64 SrcOffset, uint64 NumBytes)
+	virtual void RHICopyBufferRegion(FRHIBuffer* DestBuffer, uint64 DstOffset, FRHIBuffer* SourceBuffer, uint64 SrcOffset, uint64 NumBytes)
 	{
 		Tracker->Assert(SourceBuffer->GetWholeResourceIdentity(), ERHIAccess::CopySrc);
 		Tracker->Assert(DestBuffer->GetWholeResourceIdentity(), ERHIAccess::CopyDest);
 		RHIContext->RHICopyBufferRegion(DestBuffer, DstOffset, SourceBuffer, SrcOffset, NumBytes);
 	}
 
-	virtual void RHICopyBufferRegions(const TArrayView<const FCopyBufferRegionParams> Params)
-	{
-		for (const FCopyBufferRegionParams& Args : Params)
-		{
-			Tracker->Assert(Args.SourceBuffer->GetWholeResourceIdentity(), ERHIAccess::CopySrc);
-			Tracker->Assert(Args.DestBuffer->GetWholeResourceIdentity(), ERHIAccess::CopyDest);
-		}
-		RHIContext->RHICopyBufferRegions(Params);
-	}
-#endif
-
 	void RHIClearRayTracingBindings(FRHIRayTracingScene* Scene)
 	{
 		RHIContext->RHIClearRayTracingBindings(Scene);
 	}
-
-	virtual void RHIBuildAccelerationStructures(const TArrayView<const FAccelerationStructureBuildParams> Params) override final
+	
+	void RHICommitRayTracingBindings(FRHIRayTracingScene* Scene)
 	{
-		RHIContext->RHIBuildAccelerationStructures(Params);
+		RHIContext->RHICommitRayTracingBindings(Scene);
 	}
 
-	virtual void RHIBuildAccelerationStructure(FRHIRayTracingScene* Scene) override final
+	void RHIClearShaderBindingTable(FRHIShaderBindingTable* SBT)
 	{
-		RHIContext->RHIBuildAccelerationStructure(Scene);
+		SBT->SetCommitted(false);
+		RHIContext->RHIClearShaderBindingTable(SBT);
 	}
 
-	virtual void RHIRayTraceOcclusion(FRHIRayTracingScene* Scene,
-		FRHIShaderResourceView* Rays,
-		FRHIUnorderedAccessView* Output,
-		uint32 NumRays) override final
+	void RHICommitShaderBindingTable(FRHIShaderBindingTable* SBT)
 	{
-		RHIContext->RHIRayTraceOcclusion(Scene, Rays, Output, NumRays);
+		SBT->SetCommitted(true);
+		RHIContext->RHICommitShaderBindingTable(SBT);
 	}
 
-	virtual void RHIRayTraceIntersection(FRHIRayTracingScene* Scene,
-		FRHIShaderResourceView* Rays,
-		FRHIUnorderedAccessView* Output,
-		uint32 NumRays) override final
+	virtual void RHIBuildAccelerationStructures(TConstArrayView<FRayTracingGeometryBuildParams> Params, const FRHIBufferRange& ScratchBufferRange) override final
 	{
-		RHIContext->RHIRayTraceIntersection(Scene, Rays, Output, NumRays);
+		// #yuriy_todo: explicit transitions and state validation for BLAS
+		RHIContext->RHIBuildAccelerationStructures(Params, ScratchBufferRange);
+	}
+
+	virtual void RHIBuildAccelerationStructure(const FRayTracingSceneBuildParams& SceneBuildParams) override final
+	{
+		// #yuriy_todo: validate all referenced BLAS states
+		if (SceneBuildParams.Scene)
+		{
+			Tracker->Assert(SceneBuildParams.Scene->GetWholeResourceIdentity(), ERHIAccess::BVHWrite);
+		}
+		RHIContext->RHIBuildAccelerationStructure(SceneBuildParams);
+	}
+
+	virtual void RHIBindAccelerationStructureMemory(FRHIRayTracingScene* Scene, FRHIBuffer* Buffer, uint32 BufferOffset) override final
+	{
+		RHIContext->RHIBindAccelerationStructureMemory(Scene, Buffer, BufferOffset);
 	}
 
 	virtual void RHIRayTraceDispatch(FRHIRayTracingPipelineState* RayTracingPipelineState, FRHIRayTracingShader* RayGenShader,
-		FRHIRayTracingScene* Scene,
-		const FRayTracingShaderBindings& GlobalResourceBindings,
+		FRHIShaderBindingTable* SBT, const FRayTracingShaderBindings& GlobalResourceBindings,
 		uint32 Width, uint32 Height) override final
 	{
-		RHIContext->RHIRayTraceDispatch(RayTracingPipelineState, RayGenShader, Scene, GlobalResourceBindings, Width, Height);
+		ensureMsgf(SBT->IsCommitted(), TEXT("RayTracing bindings have not been committed. You must call CommitRayTracingBindings first."));
+		RHIContext->RHIRayTraceDispatch(RayTracingPipelineState, RayGenShader, SBT, GlobalResourceBindings, Width, Height);
 	}
 
-	virtual void RHISetRayTracingHitGroups(FRHIRayTracingScene* Scene, FRHIRayTracingPipelineState* Pipeline, uint32 NumBindings, const FRayTracingLocalShaderBindings* Bindings) override final
+	virtual void RHIRayTraceDispatchIndirect(FRHIRayTracingPipelineState* RayTracingPipelineState, FRHIRayTracingShader* RayGenShader,
+		FRHIShaderBindingTable* SBT, const FRayTracingShaderBindings& GlobalResourceBindings,
+		FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override final
 	{
-		RHIContext->RHISetRayTracingHitGroups(Scene, Pipeline, NumBindings, Bindings);
+		FValidationRHI::ValidateDispatchIndirectArgsBuffer(ArgumentBuffer, ArgumentOffset);
+		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::IndirectArgs);
+		Tracker->Assert(ArgumentBuffer->GetWholeResourceIdentity(), ERHIAccess::SRVCompute);
+
+		ensureMsgf(SBT->IsCommitted(), TEXT("RayTracing bindings have not been committed. You must call CommitRayTracingBindings first."));
+		RHIContext->RHIRayTraceDispatchIndirect(RayTracingPipelineState, RayGenShader, SBT, GlobalResourceBindings, ArgumentBuffer, ArgumentOffset);
 	}
 
-	virtual void RHISetRayTracingHitGroup(
-		FRHIRayTracingScene* Scene, uint32 InstanceIndex, uint32 SegmentIndex, uint32 ShaderSlot,
-		FRHIRayTracingPipelineState* Pipeline, uint32 HitGroupIndex,
-		uint32 NumUniformBuffers, FRHIUniformBuffer* const* UniformBuffers,
-		uint32 LooseParameterDataSize, const void* LooseParameterData,
-		uint32 UserData) override final
+	virtual void RHISetBindingsOnShaderBindingTable(FRHIShaderBindingTable* SBT, FRHIRayTracingPipelineState* Pipeline, uint32 NumBindings, const FRayTracingLocalShaderBindings* Bindings, ERayTracingBindingType BindingType) override final
 	{
-		RHIContext->RHISetRayTracingHitGroup(Scene, InstanceIndex, SegmentIndex, ShaderSlot, Pipeline, HitGroupIndex, NumUniformBuffers, UniformBuffers, LooseParameterDataSize, LooseParameterData, UserData);
+		SBT->SetCommitted(false);
+		RHIContext->RHISetBindingsOnShaderBindingTable(SBT, Pipeline, NumBindings, Bindings, BindingType);
 	}
 
-	virtual void RHISetRayTracingCallableShader(
-		FRHIRayTracingScene* Scene, uint32 ShaderSlotInScene,
-		FRHIRayTracingPipelineState* Pipeline, uint32 ShaderIndexInPipeline,
-		uint32 NumUniformBuffers, FRHIUniformBuffer* const* UniformBuffers,
-		uint32 UserData) override final
-	{
-		RHIContext->RHISetRayTracingCallableShader(Scene, ShaderSlotInScene, Pipeline, ShaderIndexInPipeline, NumUniformBuffers, UniformBuffers, UserData);
-	}
+	void ValidateDispatch();
+	void ValidateDrawing();
 
-	virtual void RHISetRayTracingMissShader(
-		FRHIRayTracingScene* Scene, uint32 ShaderSlotInScene,
-		FRHIRayTracingPipelineState* Pipeline, uint32 ShaderIndexInPipeline,
-		uint32 NumUniformBuffers, FRHIUniformBuffer* const* UniformBuffers,
-		uint32 UserData) override final
-	{
-		RHIContext->RHISetRayTracingMissShader(Scene, ShaderSlotInScene, Pipeline, ShaderIndexInPipeline, NumUniformBuffers, UniformBuffers, UserData);
-	}
-
-	void SetupDrawing()
-	{
-		// nothing to validate right now
-	}
-
-	IRHICommandContext* RHIContext;
+	IRHICommandContext* RHIContext = nullptr;
 
 	inline void LinkToContext(IRHICommandContext* PlatformContext)
 	{
@@ -960,88 +1221,46 @@ public:
 		PlatformContext->Tracker = &State.TrackerInstance;
 	}
 
-
 protected:
 	struct FState
 	{
-		RHIValidation::FTracker TrackerInstance;
+		RHIValidation::FTracker TrackerInstance{ ERHIPipeline::Graphics };
+		RHIValidation::FStaticUniformBuffers StaticUniformBuffers;
+		RHIValidation::FBoundUniformBuffers BoundUniformBuffers;
 
-		bool bInsideBeginRenderPass;
 		FRHIRenderPassInfo RenderPassInfo;
 		FString RenderPassName;
 		FString PreviousRenderPassName;
 		FString ComputePassName;
-		bool bGfxPSOSet;
-		bool bComputeShaderSet;
 
-		FState()
-			: TrackerInstance(ERHIPipeline::Graphics)
-		{}
+		FRHIShader* BoundShaders[SF_NumFrequencies] = {};
+
+		bool bGfxPSOSet{};
+		bool bInsideBeginRenderPass{};
 
 		void Reset();
-	};
-	FState State;
+	} State;
 
-	friend class FValidationRHICommandContextContainer;
 	friend class FValidationRHI;
-};
 
-class FValidationRHICommandContextContainer final : public IRHICommandContextContainer
-{
-	static TLockFreePointerListUnordered<FValidationContext, PLATFORM_CACHE_LINE_SIZE> ParallelCommandContexts;
-
-	TArray<RHIValidation::FOperationsList> CompletedOpLists;
-
-	IRHICommandContextContainer* InnerContainer;
-	FValidationContext* CurrentContext;
-
-public:
-	FValidationRHICommandContextContainer(IRHICommandContextContainer* InInnerContainer)
-		: InnerContainer(InInnerContainer)
-		, CurrentContext(nullptr)
-	{}
-
-	virtual IRHICommandContext* GetContext() final override
+private:
+	void ValidateDepthStencilForSetGraphicsPipelineState(const FExclusiveDepthStencil& DSMode)
 	{
-		check(CurrentContext == nullptr);
-		CurrentContext = ParallelCommandContexts.Pop();
+		FRHIRenderPassInfo::FDepthStencilEntry& DSV = State.RenderPassInfo.DepthStencilRenderTarget;
 
-		if (!CurrentContext)
+		// assert depth is in the correct mode
+		if (DSMode.IsUsingDepth())
 		{
-			CurrentContext = new FValidationContext();
+			checkf(DSV.ExclusiveDepthStencil.IsUsingDepth(), TEXT("Graphics PSO is using depth but it's not enabled on the RenderPass."));
+			checkf(DSMode.IsDepthRead() || DSV.ExclusiveDepthStencil.IsDepthWrite(), TEXT("Graphics PSO is writing to depth but RenderPass depth is ReadOnly."));
 		}
 
-		CurrentContext->State.Reset();
-		CurrentContext->LinkToContext(InnerContainer->GetContext());
-
-		return CurrentContext;
-	}
-
-	virtual void FinishContext() final override
-	{
-		check(CurrentContext);
-
-		InnerContainer->FinishContext();
-		CompletedOpLists.Emplace(CurrentContext->Tracker->Finalize());
-
-		ParallelCommandContexts.Push(CurrentContext);
-		CurrentContext = nullptr;
-	}
-
-	virtual void SubmitAndFreeContextContainer(int32 Index, int32 Num) final override
-	{
-		using namespace RHIValidation;
-		check(CurrentContext == nullptr);
-
-		InnerContainer->SubmitAndFreeContextContainer(Index, Num);
-
-		for (FOperationsList& OpList : CompletedOpLists)
+		// assert stencil is in the correct mode
+		if (DSMode.IsUsingStencil())
 		{
-			// Replay or queue any barrier operations to validate resource barrier usage.
-			FTracker::ReplayOpQueue(ERHIPipeline::Graphics, MoveTemp(OpList));
+			checkf(DSV.ExclusiveDepthStencil.IsUsingStencil(), TEXT("Graphics PSO is using stencil but it's not enabled on the RenderPass."));
+			checkf(DSMode.IsStencilRead() || DSV.ExclusiveDepthStencil.IsStencilWrite(), TEXT("Graphics PSO is writing to stencil but RenderPass stencil is ReadOnly."));
 		}
-
-		delete this;
 	}
 };
 

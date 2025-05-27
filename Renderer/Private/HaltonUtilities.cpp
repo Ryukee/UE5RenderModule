@@ -25,13 +25,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// This file has been adapted to UE4
+// This file has been adapted to UE
 
 #include "HaltonUtilities.h"
 
 #define PERMUTATION_BUFFER TArray
 
-float asfloat(unsigned int integer)
+static float asfloat(unsigned int integer)
 {
 	union {
 		unsigned int u;
@@ -41,7 +41,7 @@ float asfloat(unsigned int integer)
 	return value.f;
 }
 
-#include "../../../Shaders/Private/HaltonUtilities.ush"
+#include "HaltonUtilities.ush"
 
 /**
  * Binds dimensions to consecutive Halton sequences. Note that sequences based on primes

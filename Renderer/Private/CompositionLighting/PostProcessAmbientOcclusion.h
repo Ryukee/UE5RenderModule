@@ -6,12 +6,13 @@
 
 #pragma once
 
-#include "CoreMinimal.h"
+#include "ScreenPass.h"
 #include "UniformBuffer.h"
 #include "RendererInterface.h"
-#include "PostProcess/RenderingCompositionGraph.h"
 
 class FViewInfo;
+
+struct FRDGSystemTextures;
 
 enum class ESSAOType
 {
@@ -51,6 +52,12 @@ enum EGTAOPass
 	EGTAOPass_Upsample					= 0x20,
 };
 
+FRDGTextureDesc GetScreenSpaceAOTextureDesc(ERHIFeatureLevel::Type FeatureLevel, FIntPoint Extent);
+
+FRDGTextureRef CreateScreenSpaceAOTexture(FRDGBuilder& GraphBuilder, ERHIFeatureLevel::Type FeatureLevel, FIntPoint Extent);
+
+FRDGTextureRef GetScreenSpaceAOFallback(const FRDGSystemTextures& SystemTextures);
+
 class FGTAOContext
 {
 public:
@@ -83,7 +90,7 @@ public:
 	static int32 GetAmbientOcclusionShaderLevel(const FSceneView& View);
 
 	// @return whether AmbientOcclusion should run a compute shader.
-	static bool IsAmbientOcclusionCompute(const FSceneView& View);
+	static bool IsAmbientOcclusionCompute(const ERHIFeatureLevel::Type FeatureLevel);
 
 	static int32 GetNumAmbientOcclusionLevels();
 	static float GetAmbientOcclusionStepMipLevelFactor();
@@ -100,16 +107,8 @@ public:
 
 // SSAO
 
-/** TODO: The RHI version of the uniform buffer is used on all compute shaders because RDG does not yet support reads
- *  from multiple pipes (e.g. reading depth from both async compute and graphics). Using the RDG version of the uniform
- *  buffer ends up joining the async work back to graphics on the depth read. This temporary solution just uses the RHI
- *  uniform buffer to avoid registering the textures with RDG. This only works because depth is required to be
- *  read-only by previous passes. This can be removed once RDG supports multi-pipe transitions.
- */
-
 struct FSSAOCommonParameters
 {
-	TUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBufferRHI;
 	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer = nullptr;
 	FScreenPassTextureViewport SceneTexturesViewport;
 
@@ -153,7 +152,6 @@ FScreenPassTexture AddAmbientOcclusionFinalPass(
 
 struct FGTAOCommonParameters
 {
-	TUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBufferRHI;
 	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTexturesUniformBuffer = nullptr;
 	FScreenPassTextureViewport SceneTexturesViewport;
 	
@@ -228,3 +226,26 @@ FScreenPassTexture AddGTAOUpsamplePass(
 	FScreenPassTexture Input,
 	FScreenPassTexture SceneDepth,
 	FScreenPassRenderTarget Output);
+
+
+// Shared declarations for PC and mobile. 
+
+BEGIN_SHADER_PARAMETER_STRUCT(FHZBParameters, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HZBTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, HZBSampler)
+	SHADER_PARAMETER(FScreenTransform, HZBRemapping)
+END_SHADER_PARAMETER_STRUCT();
+
+BEGIN_SHADER_PARAMETER_STRUCT(FTextureBinding, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, Texture)
+	SHADER_PARAMETER(FIntPoint, TextureSize)
+	SHADER_PARAMETER(FVector2f, InverseTextureSize)
+END_SHADER_PARAMETER_STRUCT();
+
+enum class EAOTechnique
+{
+	SSAO,
+	GTAO,
+};
+
+FHZBParameters GetHZBParameters(const FViewInfo& View, FScreenPassTexture HZBInput, FIntPoint InputTextureSize, EAOTechnique AOTechnique);

@@ -1,16 +1,21 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "PostProcess/PostProcessMitchellNetravali.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "SceneUtils.h"
 #include "SceneRendering.h"
 #include "ScenePrivate.h"
 #include "SceneTextureParameters.h"
+#include "PostProcessing.h"
 
 class FMitchellNetravaliDownsampleCS : public FGlobalShader
 {
 public:
 	DECLARE_GLOBAL_SHADER(FMitchellNetravaliDownsampleCS);
 	SHADER_USE_PARAMETER_STRUCT(FMitchellNetravaliDownsampleCS, FGlobalShader);
+
+	class FAlphaChannelDim : SHADER_PERMUTATION_BOOL("DIM_ALPHA_CHANNEL");
+	using FPermutationDomain = TShaderPermutationDomain<FAlphaChannelDim>;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -22,10 +27,10 @@ public:
 		SHADER_PARAMETER_STRUCT(FScreenPassTextureViewportParameters, Input)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, EyeAdaptationTexture)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, EyeAdaptationBuffer)
 		SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
-		SHADER_PARAMETER(FVector2D, DispatchThreadToInputUVScale)
-		SHADER_PARAMETER(FVector2D, DispatchThreadToInputUVBias)
+		SHADER_PARAMETER(FVector2f, DispatchThreadToInputUVScale)
+		SHADER_PARAMETER(FVector2f, DispatchThreadToInputUVBias)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -51,7 +56,7 @@ FRDGTextureRef ComputeMitchellNetravaliDownsample(
 	PassParameters->InputTexture = Input.Texture;
 	PassParameters->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	PassParameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
-	PassParameters->EyeAdaptationTexture = GetEyeAdaptationTexture(GraphBuilder, View);
+	PassParameters->EyeAdaptationBuffer = GraphBuilder.CreateSRV(GetEyeAdaptationBuffer(GraphBuilder, View));
 
 	// Scale / Bias factor to map the dispatch thread id to the input texture UV.
 	PassParameters->DispatchThreadToInputUVScale.X = Input.ViewRect.Width()  / float(OutputViewport.Rect.Width()  * Input.Texture->Desc.Extent.X);
@@ -59,11 +64,19 @@ FRDGTextureRef ComputeMitchellNetravaliDownsample(
 	PassParameters->DispatchThreadToInputUVBias.X = PassParameters->DispatchThreadToInputUVScale.X * (0.5f + Input.ViewRect.Min.X);
 	PassParameters->DispatchThreadToInputUVBias.Y = PassParameters->DispatchThreadToInputUVScale.Y * (0.5f + Input.ViewRect.Min.Y);
 
-	TShaderMapRef<FMitchellNetravaliDownsampleCS> ComputeShader(View.ShaderMap);
+	FMitchellNetravaliDownsampleCS::FPermutationDomain PermutationVector;
+	PermutationVector.Set<FMitchellNetravaliDownsampleCS::FAlphaChannelDim>(IsPostProcessingWithAlphaChannelSupported());
+
+	TShaderMapRef<FMitchellNetravaliDownsampleCS> ComputeShader(View.ShaderMap, PermutationVector);
 
 	FComputeShaderUtils::AddPass(
 		GraphBuilder,
-		RDG_EVENT_NAME("MitchellNetravaliDownsample %dx%d -> %dx%d", Input.ViewRect.Width(), Input.ViewRect.Height(), OutputViewport.Rect.Width(), OutputViewport.Rect.Height()),
+		RDG_EVENT_NAME("MitchellNetravaliDownsample(%s) %dx%d -> %dx%d",
+			PermutationVector.Get<FMitchellNetravaliDownsampleCS::FAlphaChannelDim>() ? TEXT("Alpha") : TEXT(""),
+			Input.ViewRect.Width(),
+			Input.ViewRect.Height(),
+			OutputViewport.Rect.Width(),
+			OutputViewport.Rect.Height()),
 		ComputeShader,
 		PassParameters,
 		FComputeShaderUtils::GetGroupCount(OutputViewport.Rect.Size(), FComputeShaderUtils::kGolden2DGroupSize));

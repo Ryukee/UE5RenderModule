@@ -6,14 +6,17 @@
 
 #include "ClearQuad.h"
 #include "SceneRendering.h"
-#include "SceneRenderTargets.h"
+#include "PostProcess/SceneRenderTargets.h"
 #include "SceneUtils.h"
 #include "RenderTargetPool.h"
 #include "RHIResources.h"
 #include "UniformBuffer.h"
-#include "RHI/Public/PipelineStateCache.h"
-#include "Raytracing/RaytracingOptions.h"
+#include "PipelineStateCache.h"
+#include "RayTracing/RaytracingOptions.h"
+#include "RayTracing/RayTracing.h"
 #include "RayTracingMaterialHitShaders.h"
+#include "RayTracingDefinitions.h"
+#include "ScenePrivate.h"
 #include "SceneTextureParameters.h"
 
 #include "PostProcess/PostProcessing.h"
@@ -26,7 +29,7 @@ static FAutoConsoleVariableRef CVarRayTracingAmbientOcclusion(
 	TEXT("-1: Value driven by postprocess volume (default) \n")
 	TEXT(" 0: ray tracing ambient occlusion off \n")
 	TEXT(" 1: ray tracing ambient occlusion enabled"),
-	ECVF_RenderThreadSafe
+	ECVF_RenderThreadSafe | ECVF_Scalability
 );
 
 static TAutoConsoleVariable<int32> CVarUseAODenoiser(
@@ -65,9 +68,9 @@ bool ShouldRenderRayTracingAmbientOcclusion(const FViewInfo& View)
 		? View.FinalPostProcessSettings.RayTracingAO > 0
 		: GRayTracingAmbientOcclusion != 0;
 
-	bEnabled &= (View.FinalPostProcessSettings.AmbientOcclusionIntensity > 0.0f);
+	bEnabled &= (View.FinalPostProcessSettings.RayTracingAOIntensity > 0.0f);
 
-	return ShouldRenderRayTracingEffect(bEnabled);
+	return ShouldRenderRayTracingEffect(bEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline, View);
 }
 
 DECLARE_GPU_STAT_NAMED(RayTracingAmbientOcclusion, TEXT("Ray Tracing Ambient Occlusion"));
@@ -87,17 +90,27 @@ class FRayTracingAmbientOcclusionRGS : public FGlobalShader
 		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
 	}
 
+	static ERayTracingPayloadType GetRayTracingPayloadType(const int32 PermutationId)
+	{
+		return ERayTracingPayloadType::RayTracingMaterial;
+	}
+
+	static const FShaderBindingLayout* GetShaderBindingLayout(const FShaderPermutationParameters& Parameters)
+	{
+		return RayTracing::GetShaderBindingLayout(Parameters.Platform);
+	}
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER(int, SamplesPerPixel)
 		SHADER_PARAMETER(float, MaxRayDistance)
 		SHADER_PARAMETER(float, Intensity)
 		SHADER_PARAMETER(float, MaxNormalBias)
-		SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(RaytracingAccelerationStructure, TLAS)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, RWAmbientOcclusionMaskUAV)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, RWAmbientOcclusionHitDistanceUAV)
-
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSubstrateGlobalUniformParameters, Substrate)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -133,8 +146,10 @@ void FDeferredShadingSceneRenderer::RenderRayTracingAmbientOcclusion(
 	FRDGTextureRef* OutAmbientOcclusionTexture)
 #if RHI_RAYTRACING
 {
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, RayTracingAmbientOcclusion, "Ray Tracing Ambient Occlusion");
 	RDG_GPU_STAT_SCOPE(GraphBuilder, RayTracingAmbientOcclusion);
-	RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing Ambient Occlusion");
+
+	const FRayTracingScene& RayTracingScene = Scene->RayTracingScene;
 
 	// Allocates denoiser inputs.
 	IScreenSpaceDenoiser::FAmbientOcclusionInputs DenoiserInputs;
@@ -157,7 +172,8 @@ void FDeferredShadingSceneRenderer::RenderRayTracingAmbientOcclusion(
 	PassParameters->MaxRayDistance = View.FinalPostProcessSettings.RayTracingAORadius;
 	PassParameters->Intensity = View.FinalPostProcessSettings.RayTracingAOIntensity;
 	PassParameters->MaxNormalBias = GetRaytracingMaxNormalBias();
-	PassParameters->TLAS = View.RayTracingScene.RayTracingSceneRHI->GetShaderResourceView();
+	PassParameters->TLAS = RayTracingScene.GetLayerView(ERayTracingSceneLayer::Base);
+	PassParameters->Substrate = Substrate::BindSubstrateGlobalUniformParameters(View);
 	PassParameters->RWAmbientOcclusionMaskUAV = GraphBuilder.CreateUAV(DenoiserInputs.Mask);
 	PassParameters->RWAmbientOcclusionHitDistanceUAV = GraphBuilder.CreateUAV(DenoiserInputs.RayHitDistance);
 	PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
@@ -168,36 +184,54 @@ void FDeferredShadingSceneRenderer::RenderRayTracingAmbientOcclusion(
 	PermutationVector.Set<FRayTracingAmbientOcclusionRGS::FEnableMaterialsDim>(CVarRayTracingAmbientOcclusionEnableMaterials.GetValueOnRenderThread() != 0);
 	TShaderMapRef<FRayTracingAmbientOcclusionRGS> RayGenerationShader(GetGlobalShaderMap(FeatureLevel), PermutationVector);
 	ClearUnusedGraphResources(RayGenerationShader, PassParameters);
+	
+	FRHIUniformBuffer* SceneUniformBuffer = View.GetSceneUniforms().GetBufferRHI(GraphBuilder);
 
 	FIntPoint RayTracingResolution = View.ViewRect.Size();
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("AmbientOcclusionRayTracing(SamplePerPixels=%d) %dx%d", RayTracingConfig.RayCountPerPixel, RayTracingResolution.X, RayTracingResolution.Y),
 		PassParameters,
 		ERDGPassFlags::Compute,
-		[PassParameters, this, &View, RayGenerationShader, RayTracingResolution](FRHICommandList& RHICmdList)
+		[PassParameters, this, &View, SceneUniformBuffer, RayGenerationShader, RayTracingResolution, &RayTracingScene](FRHICommandList& RHICmdList)
 	{
-		FRayTracingShaderBindingsWriter GlobalResources;
+		FRHIBatchedShaderParameters& GlobalResources = RHICmdList.GetScratchShaderParameters();
 		SetShaderParameters(GlobalResources, RayGenerationShader, *PassParameters);
+		TOptional<FScopedUniformBufferStaticBindings> StaticUniformBufferScope = RayTracing::BindStaticUniformBufferBindings(View, SceneUniformBuffer, RHICmdList);
 
 		// TODO: Provide material support for opacity mask
 		FRayTracingPipelineState* Pipeline = View.RayTracingMaterialPipeline;
+		FShaderBindingTableRHIRef SBT = View.RayTracingSBT;
 		if (CVarRayTracingAmbientOcclusionEnableMaterials.GetValueOnRenderThread() == 0)
 		{
 			// Declare default pipeline
 			FRayTracingPipelineStateInitializer Initializer;
-			Initializer.MaxPayloadSizeInBytes = 64; // sizeof(FPackedMaterialClosestHitPayload)
+			Initializer.MaxPayloadSizeInBytes = GetRayTracingPayloadTypeMaxSize(ERayTracingPayloadType::RayTracingMaterial);
+			
+			const FShaderBindingLayout* ShaderBindingLayout = RayTracing::GetShaderBindingLayout(ShaderPlatform);
+			if (ShaderBindingLayout)
+			{
+				Initializer.ShaderBindingLayout = &ShaderBindingLayout->RHILayout;
+			}
+
 			FRHIRayTracingShader* RayGenShaderTable[] = { RayGenerationShader.GetRayTracingShader() };
 			Initializer.SetRayGenShaderTable(RayGenShaderTable);
 
-			FRHIRayTracingShader* HitGroupTable[] = { View.ShaderMap->GetShader<FOpaqueShadowHitGroup>().GetRayTracingShader() };
+			FRHIRayTracingShader* HitGroupTable[] = { GetRayTracingDefaultOpaqueShader(View.ShaderMap) };
 			Initializer.SetHitGroupTable(HitGroupTable);
-			Initializer.bAllowHitGroupIndexing = false; // Use the same hit shader for all geometry in the scene by disabling SBT indexing.
+						
+			FRHIRayTracingShader* MissGroupTable[] = { GetRayTracingDefaultMissShader(View.ShaderMap) };
+			Initializer.SetMissShaderTable(MissGroupTable);
 
 			Pipeline = PipelineStateCache::GetAndOrCreateRayTracingPipelineState(RHICmdList, Initializer);
+
+			SBT = Scene->RayTracingSBT.AllocateRHI(RHICmdList, ERayTracingShaderBindingMode::RTPSO, ERayTracingHitGroupIndexingMode::Disallow, RayTracingScene.NumMissShaderSlots, RayTracingScene.NumCallableShaderSlots, Initializer.GetMaxLocalBindingDataSize());
+
+			RHICmdList.SetDefaultRayTracingHitGroup(SBT, Pipeline, 0);
+			RHICmdList.SetRayTracingMissShader(SBT, 0, Pipeline, 0 /* ShaderIndexInPipeline */, 0, nullptr, 0);
+			RHICmdList.CommitShaderBindingTable(SBT);
 		}
 
-		FRHIRayTracingScene* RayTracingSceneRHI = View.RayTracingScene.RayTracingSceneRHI;
-		RHICmdList.RayTraceDispatch(Pipeline, RayGenerationShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, RayTracingResolution.X, RayTracingResolution.Y);
+		RHICmdList.RayTraceDispatch(Pipeline, RayGenerationShader.GetRayTracingShader(), SBT, GlobalResources, RayTracingResolution.X, RayTracingResolution.Y);
 	});
 
 	int32 DenoiserMode = CVarUseAODenoiser.GetValueOnRenderThread();

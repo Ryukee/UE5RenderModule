@@ -4,15 +4,30 @@
 RHIUtilities.cpp:
 =============================================================================*/
 
-#include "CoreMinimal.h"
+#include "RHIUtilities.h"
+#include "Async/TaskGraphInterfaces.h"
 #include "HAL/PlatformStackWalk.h"
-#include "HAL/IConsoleManager.h"
 #include "RHI.h"
+#include "GenericPlatform/GenericPlatformFramePacer.h"
 #include "HAL/Runnable.h"
 #include "HAL/RunnableThread.h"
-#include "Misc/ScopeLock.h"
+#include "HAL/PlatformFramePacer.h"
+#include "Misc/CommandLine.h"
+#include "RHIAccess.h"
+#include "RHIFwd.h"
+#include "RHIStrings.h"
+#include "Tasks/Task.h"
+#include "ProfilingDebugging/MiscTrace.h"
 
 #define USE_FRAME_OFFSET_THREAD 1
+
+#if !UE_BUILD_SHIPPING && PLATFORM_SUPPORTS_FLIP_TRACKING
+bool GVsyncInformationInsights = false;
+static FAutoConsoleVariableRef CVarVsyncInformationInsights(
+	TEXT("r.VsyncInformationInsights"),
+	GVsyncInformationInsights,
+	TEXT("Whether to show Vsync and Input events in UnrealInsights"));
+#endif
 
 TAutoConsoleVariable<FString> FDumpTransitionsHelper::CVarDumpTransitionsForResource(
 	TEXT("r.DumpTransitionsForResource"),
@@ -20,8 +35,6 @@ TAutoConsoleVariable<FString> FDumpTransitionsHelper::CVarDumpTransitionsForReso
 	TEXT("Prints callstack when the given resource is transitioned. Only implemented for DX11 at the moment.")
 	TEXT("Name of the resource to dump"),
 	ECVF_Default);
-
-RHI_API FRHILockTracker GRHILockTracker;
 
 FName FDumpTransitionsHelper::DumpTransitionForResource = NAME_None;
 void FDumpTransitionsHelper::DumpTransitionForResourceHandler()
@@ -52,8 +65,8 @@ void SetDepthBoundsTest(FRHICommandList& RHICmdList, float WorldSpaceDepthNear, 
 	{
 		FVector4 Near = ProjectionMatrix.TransformFVector4(FVector4(0, 0, WorldSpaceDepthNear));
 		FVector4 Far = ProjectionMatrix.TransformFVector4(FVector4(0, 0, WorldSpaceDepthFar));
-		float DepthNear = Near.Z / Near.W;
-		float DepthFar = Far.Z / Far.W;
+		float DepthNear = float(Near.Z / Near.W);
+		float DepthFar = float(Far.Z / Far.W);
 
 		DepthFar = FMath::Clamp(DepthFar, 0.0f, 1.0f);
 		DepthNear = FMath::Clamp(DepthNear, 0.0f, 1.0f);
@@ -72,11 +85,13 @@ void SetDepthBoundsTest(FRHICommandList& RHICmdList, float WorldSpaceDepthNear, 
 TAutoConsoleVariable<int32> CVarRHISyncInterval(
 	TEXT("rhi.SyncInterval"),
 	1,
-	TEXT("Determines the frequency of VSyncs in supported RHIs.")
-	TEXT("  0 - Unlocked\n")
-	TEXT("  1 - 60 Hz (16.66 ms)\n")
-	TEXT("  2 - 30 Hz (33.33 ms)\n")
-	TEXT("  3 - 20 Hz (50.00 ms)\n"),
+	TEXT("Determines the frequency of VSyncs in supported RHIs.\n")
+	TEXT("This is in multiples of 16.66 on a 60hz display, but some platforms support higher refresh rates.\n")
+	TEXT("Assuming 60fps, the values correspond to:\n")
+	TEXT("  0 - Unlocked (present immediately)\n")
+	TEXT("  1 - Present every vblank interval\n")
+	TEXT("  2 - Present every 2 vblank intervals\n")
+	TEXT("  3 - etc...\n"),
 	ECVF_Default
 );
 
@@ -114,6 +129,38 @@ TAutoConsoleVariable<float> CVarRHISyncSlackMS(
 );
 #endif
 
+TAutoConsoleVariable<int32> CVarRHISyncAllowVariable(
+	TEXT("rhi.SyncAllowVariable"),
+	1,
+	TEXT("When 1, allows the RHI to use variable refresh rate, if supported by the output hardware."),
+	ECVF_Default
+);
+
+float GRHIFrameTimeMS = 0.0f;
+double GLastRHITimeInSeconds = 0.0;
+
+int32 GEnableConsole120Fps = 0;
+int32 InternalEnableConsole120Fps = 0;
+static void OnEnableConsole120FpsCVarRHIChanged(IConsoleVariable* Variable)
+{
+	InternalEnableConsole120Fps &= (FPlatformMisc::GetMaxSupportedRefreshRate() >= 120);
+	if (InternalEnableConsole120Fps != GEnableConsole120Fps)
+	{
+		GEnableConsole120Fps = InternalEnableConsole120Fps;
+		// needs to update the FramePace since it updates the SyncInterval based on the RefreshRate.
+		FPlatformRHIFramePacer::SetFramePace(GEnableConsole120Fps ? 120 : 60);
+		UE_LOG(LogRHI, Log, TEXT("Console 120Fps = %d"), GEnableConsole120Fps);
+	}
+}
+
+static FAutoConsoleVariableRef CVarRHInableConsole120Fps(
+	TEXT("rhi.EnableConsole120Fps"),
+	InternalEnableConsole120Fps,
+	TEXT("Enable Console 120fps if Monitor supports it and Console is properly setup"),
+	FConsoleVariableDelegate::CreateStatic(&OnEnableConsole120FpsCVarRHIChanged),
+	ECVF_Default
+);
+
 class FRHIFrameFlipTrackingRunnable : public FRunnable
 {
 	static FRunnableThread* Thread;
@@ -124,8 +171,19 @@ class FRHIFrameFlipTrackingRunnable : public FRunnable
 	FCriticalSection CS;
 	struct FFramePair
 	{
+		FFramePair(uint64 InPresentIndex, const UE::Tasks::FTaskEvent& InEvent)
+			: PresentIndex(InPresentIndex)
+			, Event(InEvent)
+		{}
+
+		~FFramePair()
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(SyncTrigger_Swapchain);
+			Event.Trigger();
+		}
+
 		uint64 PresentIndex;
-		FGraphEventRef Event;
+		UE::Tasks::FTaskEvent Event;
 	};
 	TArray<FFramePair> FramePairs;
 
@@ -138,7 +196,7 @@ public:
 	static void Initialize();
 	static void Shutdown();
 
-	static void CompleteGraphEventOnFlip(uint64 PresentIndex, FGraphEventRef Event);
+	static void TriggerTaskEventOnFlip(uint64 PresentIndex, UE::Tasks::FTaskEvent Event);
 };
 
 FRHIFrameFlipTrackingRunnable::FRHIFrameFlipTrackingRunnable()
@@ -174,11 +232,11 @@ struct FRHIFrameOffsetThread : public FRunnable
 			FRHIFlipDetails NewFlipFrame = GDynamicRHI->RHIWaitForFlip(-1);
 
 			int32 SyncInterval = RHIGetSyncInterval();
-			double TargetFrameTimeInSeconds = double(SyncInterval) / 60.0;
-			double SlackInSeconds = RHIGetSyncSlackMS() / 1000.0;
+			double TargetFrameTimeInSeconds = double(SyncInterval) / double(FPlatformMisc::GetMaxRefreshRate());
+			double SlackInSeconds = FMath::Min(RHIGetSyncSlackMS() / 1000.0, TargetFrameTimeInSeconds);			// Clamp slack sync time to at most one full frame interval
 			double TargetFlipTime = (NewFlipFrame.VBlankTimeInSeconds + TargetFrameTimeInSeconds) - SlackInSeconds;
-
-			double Timeout = FMath::Max(0.0, TargetFlipTime - FPlatformTime::Seconds());
+			
+			double Timeout = FMath::Max(0.0, TargetFlipTime - FPlatformTime::ToSeconds64(FPlatformTime::Cycles64()));
 
 			FPlatformProcess::Sleep(Timeout);
 
@@ -195,7 +253,14 @@ struct FRHIFrameOffsetThread : public FRunnable
 					auto const& DebugInfo = FrameDebugInfos[DebugInfoIndex];
 					if (NewFlipFrame.PresentIndex == DebugInfo.PresentIndex)
 					{
-						GInputLatencyTime = (NewFlipFrame.VBlankTimeInSeconds / FPlatformTime::GetSecondsPerCycle64()) - DebugInfo.InputTime;
+						uint64 VBlankTimeInCycle = (uint64)(NewFlipFrame.VBlankTimeInSeconds / FPlatformTime::GetSecondsPerCycle64());
+
+						GInputLatencyTime = (VBlankTimeInCycle) - DebugInfo.InputTime;
+
+						if (GVsyncInformationInsights)
+						{
+							TRACE_BOOKMARK_CYCLES(VBlankTimeInCycle, TEXT("Vsync P:%d F:%d Lat:%.2f"), DebugInfo.PresentIndex, DebugInfo.FrameIndex, FPlatformTime::ToMilliseconds64(GInputLatencyTime))
+						}
 					}
 
 					if (DebugInfo.PresentIndex <= NewFlipFrame.PresentIndex)
@@ -218,6 +283,7 @@ struct FRHIFrameOffsetThread : public FRunnable
 	virtual void Stop() override
 	{
 		bRun = false;
+		GDynamicRHI->RHISignalFlipEvent();
 	}
 
 public:
@@ -260,13 +326,12 @@ public:
 
 	static void Shutdown()
 	{
-		// PS4 calls shutdown before initialize has been called, so bail out if that happens
+		// Some platforms call shutdown before initialize has been called, so bail out if that happens
 		if (!bInitialized)
 		{
 			return;
 		}
 		bInitialized = false;
-		GDynamicRHI->RHISignalFlipEvent();
 
 		if (WaitEvent)
 		{
@@ -280,22 +345,23 @@ public:
 			delete Thread;
 			Thread = nullptr;
 		}
-
-		Singleton.GetOrInitializeWaitEvent()->Trigger();
 	}
 
 	static void SetFrameDebugInfo(uint64 PresentIndex, uint64 FrameIndex, uint64 InputTime)
 	{
 #if !UE_BUILD_SHIPPING && PLATFORM_SUPPORTS_FLIP_TRACKING
 		FScopeLock Lock(&Singleton.CS);
-		if (Thread)
-		{
-			FFrameDebugInfo DebugInfo;
-			DebugInfo.PresentIndex = PresentIndex;
-			DebugInfo.FrameIndex = FrameIndex;
-			DebugInfo.InputTime = InputTime;
-			Singleton.FrameDebugInfos.Add(DebugInfo);
-		}
+
+		FFrameDebugInfo DebugInfo;
+		DebugInfo.PresentIndex = PresentIndex;
+		DebugInfo.FrameIndex = FrameIndex;
+		DebugInfo.InputTime = InputTime;
+		Singleton.FrameDebugInfos.Add(DebugInfo);
+
+ 		if (GVsyncInformationInsights)
+ 		{
+ 			TRACE_BOOKMARK_CYCLES(DebugInfo.InputTime, TEXT("Input P:%d F:%d"), DebugInfo.PresentIndex, DebugInfo.FrameIndex)
+ 		}
 #endif
 	}
 
@@ -335,7 +401,7 @@ uint32 FRHIFrameFlipTrackingRunnable::Run()
 	{
 		// Determine the next expected flip time, based on the previous flip time we synced to.
 		int32 SyncInterval = RHIGetSyncInterval();
-		double TargetFrameTimeInSeconds = double(SyncInterval) / 60.0;
+		double TargetFrameTimeInSeconds = double(SyncInterval) / double(FPlatformMisc::GetMaxRefreshRate());
 		double ExpectedNextFlipTimeInSeconds = SyncTime + (TargetFrameTimeInSeconds * 1.02); // Add 2% to prevent early timeout
 		double CurrentTimeInSeconds = FPlatformTime::Seconds();
 
@@ -363,20 +429,23 @@ uint32 FRHIFrameFlipTrackingRunnable::Run()
 			SyncTime = CurrentTimeInSeconds;
 		}
 
-		// Complete any relevant task graph events.
+		bool bUpdateRHIFrameTime = false;
+		// Complete any relevant task events.
 		FScopeLock Lock(&CS);
 		for (int32 PairIndex = FramePairs.Num() - 1; PairIndex >= 0; --PairIndex)
 		{
-			auto const& Pair = FramePairs[PairIndex];
+			auto& Pair = FramePairs[PairIndex];
 			if (Pair.PresentIndex <= SyncFrame)
 			{
-				// "Complete" the task graph event
-				TArray<FBaseGraphTask*> Subsequents;
-				Pair.Event->DispatchSubsequents(Subsequents);
-
 				FramePairs.RemoveAtSwap(PairIndex);
+				bUpdateRHIFrameTime = true;
 			}
 		}
+
+		if(bUpdateRHIFrameTime)
+		{
+			RHICalculateFrameTime();
+		}	
 	}
 
 	return 0;
@@ -426,14 +495,6 @@ void FRHIFrameFlipTrackingRunnable::Shutdown()
 
 	FScopeLock Lock(&Singleton.CS);
 
-	// Signal any remaining events
-	for (auto const& Pair : Singleton.FramePairs)
-	{
-		// "Complete" the task graph event
-		TArray<FBaseGraphTask*> Subsequents;
-		Pair.Event->DispatchSubsequents(Subsequents);
-	}
-
 	Singleton.FramePairs.Empty();
 
 #if USE_FRAME_OFFSET_THREAD
@@ -441,7 +502,7 @@ void FRHIFrameFlipTrackingRunnable::Shutdown()
 #endif
 }
 
-void FRHIFrameFlipTrackingRunnable::CompleteGraphEventOnFlip(uint64 PresentIndex, FGraphEventRef Event)
+void FRHIFrameFlipTrackingRunnable::TriggerTaskEventOnFlip(uint64 PresentIndex, UE::Tasks::FTaskEvent Event)
 {
 	if ( ! FPlatformMisc::UseRenderThread() )
 	{
@@ -452,11 +513,7 @@ void FRHIFrameFlipTrackingRunnable::CompleteGraphEventOnFlip(uint64 PresentIndex
 
 	if (Thread)
 	{
-		FFramePair Pair;
-		Pair.PresentIndex = PresentIndex;
-		Pair.Event = Event;
-
-		Singleton.FramePairs.Add(Pair);
+		Singleton.FramePairs.Emplace(PresentIndex, MoveTemp(Event));
 
 #if USE_FRAME_OFFSET_THREAD
 		FRHIFrameOffsetThread::Signal();
@@ -468,9 +525,8 @@ void FRHIFrameFlipTrackingRunnable::CompleteGraphEventOnFlip(uint64 PresentIndex
 	{
 		// Platform does not support flip tracking.
 		// Signal the event now...
-
-		TArray<FBaseGraphTask*> Subsequents;
-		Event->DispatchSubsequents(Subsequents);
+		TRACE_CPUPROFILER_EVENT_SCOPE(SyncTrigger_Swapchain);
+		Event.Trigger();
 	}
 }
 
@@ -479,40 +535,80 @@ FRHIFrameFlipTrackingRunnable FRHIFrameFlipTrackingRunnable::Singleton;
 bool FRHIFrameFlipTrackingRunnable::bInitialized = false;
 bool FRHIFrameFlipTrackingRunnable::bRun = false;
 
-RHI_API uint32 RHIGetSyncInterval()
+uint32 RHIGetSyncInterval()
 {
-	return CVarRHISyncInterval.GetValueOnAnyThread();
+	return FMath::Max(CVarRHISyncInterval.GetValueOnAnyThread(), 0);
 }
 
-RHI_API float RHIGetSyncSlackMS()
+float RHIGetSyncSlackMS()
 {
 #if USE_FRAME_OFFSET_THREAD
 	const float SyncSlackMS = CVarRHISyncSlackMS.GetValueOnAnyThread();
 #else // #if USE_FRAME_OFFSET_THREAD
-	const float SyncSlackMS = RHIGetSyncInterval() / 60.f * 1000.f;		// Sync slack is entire frame interval if we aren't using the frame offset system
+	const float SyncSlackMS = RHIGetSyncInterval() / float(FPlatformMisc::GetMaxRefreshRate()) * 1000.f;		// Sync slack is entire frame interval if we aren't using the frame offset system
 #endif // #else // #if USE_FRAME_OFFSET_THREAD
 	return SyncSlackMS;
 }
 
-RHI_API void RHIGetPresentThresholds(float& OutTopPercent, float& OutBottomPercent)
+bool RHIGetSyncAllowVariable()
+{
+	return CVarRHISyncAllowVariable.GetValueOnAnyThread() != 0;
+}
+
+void RHIGetPresentThresholds(float& OutTopPercent, float& OutBottomPercent)
 {
 	OutTopPercent = FMath::Clamp(CVarRHIPresentThresholdTop.GetValueOnAnyThread(), 0.0f, 1.0f);
 	OutBottomPercent = FMath::Clamp(CVarRHIPresentThresholdBottom.GetValueOnAnyThread(), 0.0f, 1.0f);
 }
 
-RHI_API void RHICompleteGraphEventOnFlip(uint64 PresentIndex, FGraphEventRef Event)
+void RHITriggerTaskEventOnFlip(uint64 PresentIndex, const UE::Tasks::FTaskEvent& Event)
 {
-	FRHIFrameFlipTrackingRunnable::CompleteGraphEventOnFlip(PresentIndex, Event);
+	FRHIFrameFlipTrackingRunnable::TriggerTaskEventOnFlip(PresentIndex, Event);
 }
 
-RHI_API void RHISetFrameDebugInfo(uint64 PresentIndex, uint64 FrameIndex, uint64 InputTime)
+void RHISetFrameDebugInfo(uint64 PresentIndex, uint64 FrameIndex, uint64 InputTime)
 {
 #if USE_FRAME_OFFSET_THREAD
 	FRHIFrameOffsetThread::SetFrameDebugInfo(PresentIndex, FrameIndex, InputTime);
 #endif
 }
 
-RHI_API void RHIInitializeFlipTracking()
+void RHISetVsyncDebugInfo(FRHIFlipDetails& NewFlipFrame)
+{
+#if !UE_BUILD_SHIPPING && USE_FRAME_OFFSET_THREAD && PLATFORM_SUPPORTS_FLIP_TRACKING
+	check(FRHIFrameOffsetThread::Thread == nullptr);
+
+	FScopeLock Lock(&FRHIFrameOffsetThread::Singleton.CS);
+	FRHIFrameOffsetThread::Singleton.LastFlipFrame = NewFlipFrame;
+
+	for (int32 DebugInfoIndex = FRHIFrameOffsetThread::Singleton.FrameDebugInfos.Num() - 1; DebugInfoIndex >= 0; --DebugInfoIndex)
+	{
+		auto const& DebugInfo = FRHIFrameOffsetThread::Singleton.FrameDebugInfos[DebugInfoIndex];
+		//Note that we are using PresentIndex-1 since RHISetFrameDebugInfo is setting GRHIPresentCounter-1 due to other platforms setup
+		if ((NewFlipFrame.PresentIndex-1) == DebugInfo.PresentIndex)
+		{
+			uint64 VBlankTimeInCycle = NewFlipFrame.VBlankTimeInCycles;
+
+			if (VBlankTimeInCycle > DebugInfo.InputTime)
+			{
+				GInputLatencyTime = VBlankTimeInCycle - DebugInfo.InputTime;
+			}
+			
+			if (GVsyncInformationInsights)
+			{
+				TRACE_BOOKMARK_CYCLES(VBlankTimeInCycle, TEXT("Vsync P:%d F:%d Lat:%.2f"), DebugInfo.PresentIndex, DebugInfo.FrameIndex, FPlatformTime::ToMilliseconds64(GInputLatencyTime))
+			}
+		}
+
+		if (DebugInfo.PresentIndex <= NewFlipFrame.PresentIndex)
+		{
+			FRHIFrameOffsetThread::Singleton.FrameDebugInfos.RemoveAtSwap(DebugInfoIndex);
+		}
+	}
+#endif
+}
+
+void RHIInitializeFlipTracking()
 {
 #if USE_FRAME_OFFSET_THREAD
 	FRHIFrameOffsetThread::Initialize();
@@ -520,7 +616,19 @@ RHI_API void RHIInitializeFlipTracking()
 	FRHIFrameFlipTrackingRunnable::Initialize();
 }
 
-RHI_API void RHIShutdownFlipTracking()
+void RHICalculateFrameTime()
+{
+	double CurrentTimeInSeconds = FPlatformTime::Seconds();
+	GRHIFrameTimeMS = (float)((CurrentTimeInSeconds - GLastRHITimeInSeconds) * 1000.0);
+	GLastRHITimeInSeconds = CurrentTimeInSeconds;
+}
+
+float RHIGetFrameTime()
+{
+	return GRHIFrameTimeMS;
+}
+
+void RHIShutdownFlipTracking()
 {
 	FRHIFrameFlipTrackingRunnable::Shutdown();
 #if USE_FRAME_OFFSET_THREAD
@@ -528,54 +636,62 @@ RHI_API void RHIShutdownFlipTracking()
 #endif
 }
 
-RHI_API ERHIAccess RHIGetDefaultResourceState(ETextureCreateFlags InUsage, bool bInHasInitialData)
+ERHIAccess RHIGetDefaultResourceState(ETextureCreateFlags InUsage, bool bInHasInitialData)
 {
 	// By default assume it can be bound for reading
 	ERHIAccess ResourceState = ERHIAccess::SRVMask;
 
 	if (!bInHasInitialData)
 	{
-		if (InUsage & TexCreate_RenderTargetable)
+		if (EnumHasAnyFlags(InUsage, TexCreate_RenderTargetable))
 		{
 			ResourceState = ERHIAccess::RTV;
 		}
-		else if (InUsage & TexCreate_DepthStencilTargetable)
+		else if (EnumHasAnyFlags(InUsage, TexCreate_DepthStencilTargetable))
 		{
 			ResourceState = ERHIAccess::DSVWrite | ERHIAccess::DSVRead;
 		}
-		else if (InUsage & TexCreate_UAV)
+		else if (EnumHasAnyFlags(InUsage, TexCreate_UAV))
 		{
 			ResourceState = ERHIAccess::UAVMask;
 		}
-		else if (InUsage & TexCreate_Presentable)
+		else if (EnumHasAnyFlags(InUsage, TexCreate_Presentable))
 		{
 			ResourceState = ERHIAccess::Present;
 		}
-		else if (InUsage & TexCreate_ShaderResource)
+		else if (EnumHasAnyFlags(InUsage, TexCreate_ShaderResource))
 		{
 			ResourceState = ERHIAccess::SRVMask;
+		}
+		else if (EnumHasAnyFlags(InUsage, TexCreate_Foveation))
+		{
+			ResourceState = ERHIAccess::ShadingRateSource;
 		}
 	}
 
 	return ResourceState;
 }
 
-RHI_API ERHIAccess RHIGetDefaultResourceState(EBufferUsageFlags InUsage, bool bInHasInitialData)
+ERHIAccess RHIGetDefaultResourceState(EBufferUsageFlags InUsage, bool bInHasInitialData)
 {
 	// Default reading state is different per buffer type
 	ERHIAccess DefaultReadingState = ERHIAccess::Unknown;
-	if (InUsage & BUF_IndexBuffer)
+	if (EnumHasAnyFlags(InUsage, BUF_IndexBuffer))
 	{
 		DefaultReadingState = ERHIAccess::VertexOrIndexBuffer;
 	}
-	if (InUsage & BUF_VertexBuffer)
+	if (EnumHasAnyFlags(InUsage, BUF_VertexBuffer))
 	{
 		// Could be vertex buffer or normal DataBuffer
 		DefaultReadingState = DefaultReadingState | ERHIAccess::VertexOrIndexBuffer | ERHIAccess::SRVMask;
 	}
-	if (InUsage & BUF_StructuredBuffer)
+	if (EnumHasAnyFlags(InUsage, BUF_StructuredBuffer))
 	{
 		DefaultReadingState = DefaultReadingState | ERHIAccess::SRVMask;
+	}
+	if (EnumHasAnyFlags(InUsage, BUF_AccelerationStructure))
+	{
+		DefaultReadingState = DefaultReadingState | ERHIAccess::BVHRead;
 	}
 
 	// Vertex and index buffers might not have the BUF_ShaderResource flag set and just assume
@@ -589,11 +705,15 @@ RHI_API ERHIAccess RHIGetDefaultResourceState(EBufferUsageFlags InUsage, bool bI
 	}
 	else
 	{
-		if (InUsage & BUF_UnorderedAccess)
+		if (EnumHasAnyFlags(InUsage, BUF_UnorderedAccess))
 		{
 			ResourceState = ERHIAccess::UAVMask;
 		}
-		else if (InUsage & BUF_ShaderResource)
+		else if (EnumHasAnyFlags(InUsage, BUF_AccelerationStructure))
+		{
+			ResourceState = ERHIAccess::BVHWrite;
+		}
+		else if (EnumHasAnyFlags(InUsage, BUF_ShaderResource))
 		{
 			ResourceState = DefaultReadingState | ERHIAccess::SRVMask;
 		}
@@ -604,3 +724,102 @@ RHI_API ERHIAccess RHIGetDefaultResourceState(EBufferUsageFlags InUsage, bool bI
 	return ResourceState;
 }
 
+void DecodeRenderTargetMode(ESimpleRenderTargetMode Mode, ERenderTargetLoadAction& ColorLoadAction, ERenderTargetStoreAction& ColorStoreAction, ERenderTargetLoadAction& DepthLoadAction, ERenderTargetStoreAction& DepthStoreAction, ERenderTargetLoadAction& StencilLoadAction, ERenderTargetStoreAction& StencilStoreAction, FExclusiveDepthStencil DepthStencilUsage)
+{
+	// set defaults
+	ColorStoreAction = ERenderTargetStoreAction::EStore;
+	DepthStoreAction = ERenderTargetStoreAction::EStore;
+	StencilStoreAction = ERenderTargetStoreAction::EStore;
+
+	switch (Mode)
+	{
+	case ESimpleRenderTargetMode::EExistingColorAndDepth:
+		ColorLoadAction = ERenderTargetLoadAction::ELoad;
+		DepthLoadAction = ERenderTargetLoadAction::ELoad;
+		break;
+	case ESimpleRenderTargetMode::EUninitializedColorAndDepth:
+		ColorLoadAction = ERenderTargetLoadAction::ENoAction;
+		DepthLoadAction = ERenderTargetLoadAction::ENoAction;
+		break;
+	case ESimpleRenderTargetMode::EUninitializedColorExistingDepth:
+		ColorLoadAction = ERenderTargetLoadAction::ENoAction;
+		DepthLoadAction = ERenderTargetLoadAction::ELoad;
+		break;
+	case ESimpleRenderTargetMode::EUninitializedColorClearDepth:
+		ColorLoadAction = ERenderTargetLoadAction::ENoAction;
+		DepthLoadAction = ERenderTargetLoadAction::EClear;
+		break;
+	case ESimpleRenderTargetMode::EClearColorExistingDepth:
+		ColorLoadAction = ERenderTargetLoadAction::EClear;
+		DepthLoadAction = ERenderTargetLoadAction::ELoad;
+		break;
+	case ESimpleRenderTargetMode::EClearColorAndDepth:
+		ColorLoadAction = ERenderTargetLoadAction::EClear;
+		DepthLoadAction = ERenderTargetLoadAction::EClear;
+		break;
+	case ESimpleRenderTargetMode::EExistingContents_NoDepthStore:
+		ColorLoadAction = ERenderTargetLoadAction::ELoad;
+		DepthLoadAction = ERenderTargetLoadAction::ELoad;
+		DepthStoreAction = ERenderTargetStoreAction::ENoAction;
+		break;
+	case ESimpleRenderTargetMode::EExistingColorAndClearDepth:
+		ColorLoadAction = ERenderTargetLoadAction::ELoad;
+		DepthLoadAction = ERenderTargetLoadAction::EClear;
+		break;
+	case ESimpleRenderTargetMode::EExistingColorAndDepthAndClearStencil:
+		ColorLoadAction = ERenderTargetLoadAction::ELoad;
+		DepthLoadAction = ERenderTargetLoadAction::ELoad;
+		break;
+	default:
+		UE_LOG(LogRHI, Fatal, TEXT("Using a ESimpleRenderTargetMode that wasn't decoded in DecodeRenderTargetMode [value = %d]"), (int32)Mode);
+	}
+
+	StencilLoadAction = DepthLoadAction;
+
+	if (!DepthStencilUsage.IsUsingDepth())
+	{
+		DepthLoadAction = ERenderTargetLoadAction::ENoAction;
+	}
+
+	//if we aren't writing to depth, there's no reason to store it back out again.  Should save some bandwidth on mobile platforms.
+	if (!DepthStencilUsage.IsDepthWrite())
+	{
+		DepthStoreAction = ERenderTargetStoreAction::ENoAction;
+	}
+
+	if (!DepthStencilUsage.IsUsingStencil())
+	{
+		StencilLoadAction = ERenderTargetLoadAction::ENoAction;
+	}
+
+	//if we aren't writing to stencil, there's no reason to store it back out again.  Should save some bandwidth on mobile platforms.
+	if (!DepthStencilUsage.IsStencilWrite())
+	{
+		StencilStoreAction = ERenderTargetStoreAction::ENoAction;
+	}
+}
+
+EGpuVendorId RHIGetPreferredAdapterVendor()
+{
+	if (FParse::Param(FCommandLine::Get(), TEXT("preferAMD")))
+	{
+		return EGpuVendorId::Amd;
+	}
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("preferIntel")))
+	{
+		return EGpuVendorId::Intel;
+	}
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("preferNvidia")))
+	{
+		return EGpuVendorId::Nvidia;
+	}
+
+	if (FParse::Param(FCommandLine::Get(), TEXT("preferMS")) || FParse::Param(FCommandLine::Get(), TEXT("preferMicrosoft")))
+	{
+		return EGpuVendorId::Microsoft;
+	}
+
+	return EGpuVendorId::Unknown;
+}
